@@ -66,6 +66,42 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
         }
         return outputs
+    
+    def infer_realtime(self, obs: dict, prev_action_chunk: jax.Array,  # [batch, horizon, action_dim]
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule,
+        max_guidance_weight: float):
+        """Infer actions in real-time with a prefix attention schedule."""
+                # Make a copy since transformations may modify the inputs in place.
+        inputs = jax.tree.map(lambda x: x, obs)
+
+        inputs = self._input_transform(inputs)
+
+        # Make a batch and convert to jax.Array.
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+
+        shapes = jax.tree.map(lambda x: x.shape, inputs)
+        print("Input shapes3:", shapes)
+
+        start_time = time.monotonic()
+        self._rng, sample_rng = jax.random.split(self._rng)
+        outputs = {
+            "state": inputs["state"],
+            "actions": self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs, inference_delay=inference_delay,
+                prev_action_chunk=prev_action_chunk, prefix_attention_horizon=prefix_attention_horizon,
+                prefix_attention_schedule=prefix_attention_schedule, max_guidance_weight=max_guidance_weight),
+        }
+        # Unbatch and convert to np.ndarray.        # Unbatch and convert to np.ndarray.
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        model_time = time.monotonic() - start_time
+
+        outputs = self._output_transform(outputs)
+        outputs["policy_timing"] = {
+            "infer_ms": model_time * 1000,
+        }
+        return outputs
+        
 
     @property
     def metadata(self) -> dict[str, Any]:
