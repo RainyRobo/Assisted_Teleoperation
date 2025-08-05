@@ -268,6 +268,13 @@ class BaseModel(nnx.Module, abc.ABC):
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
+    
+    @abc.abstractmethod
+    def sample_actions_rtc(self, rng: at.KeyArrayLike, observation: Observation, prev_action_chunk: jax.Array,
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        max_guidance_weight: float) -> Actions: ...
+    
 
 
 def restore_params(

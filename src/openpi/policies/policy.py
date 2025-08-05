@@ -31,7 +31,8 @@ class Policy(BasePolicy):
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ):
-        self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+        # self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+        self._sample_actions = nnx_utils.module_jit(model.sample_actions_rtc)
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._rng = rng or jax.random.key(0)
@@ -67,6 +68,7 @@ class Policy(BasePolicy):
         }
         return outputs
     
+    @override
     def infer_realtime(self, obs: dict, prev_action_chunk: jax.Array,  # [batch, horizon, action_dim]
         inference_delay: int,
         prefix_attention_horizon: int,
@@ -88,9 +90,9 @@ class Policy(BasePolicy):
         self._rng, sample_rng = jax.random.split(self._rng)
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs, inference_delay=inference_delay,
+            "actions": self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), inference_delay=inference_delay,
                 prev_action_chunk=prev_action_chunk, prefix_attention_horizon=prefix_attention_horizon,
-                prefix_attention_schedule=prefix_attention_schedule, max_guidance_weight=max_guidance_weight),
+                prefix_attention_schedule=prefix_attention_schedule, max_guidance_weight=max_guidance_weight, **self._sample_kwargs),
         }
         # Unbatch and convert to np.ndarray.        # Unbatch and convert to np.ndarray.
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
