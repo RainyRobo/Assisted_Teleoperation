@@ -89,16 +89,17 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            logging.info("Using Checkpoint policy from %s", args.policy.dir)
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
             )
         case Default():
+            logging.info("Using Default policy for env %s", args.env)
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
 def main(args: Args) -> None:
 
-    # 简单讲：
     policy = create_policy(args)
     policy_metadata = policy.metadata
 

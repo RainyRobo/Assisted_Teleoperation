@@ -56,14 +56,19 @@ class WebsocketPolicyServer:
             try:
                 start_time = time.monotonic()
                 args = msgpack_numpy.unpackb(await websocket.recv())
-                realtime = args.get("realtime", True)
+                realtime = args.get("realtime", False)
+                # print("AAAAAAAAA: args: ", args.keys())
                 infer_time = time.monotonic()
                 if not realtime:
                     # If not realtime, we can just use the infer method.
                     action = self._policy.infer(args)
                 else:
+                    if "obs" not in args:
+                        print("No observations provided for real-time inference.")
+                    else:
+                        print("Real-time inference with observations:")
                     action = self._policy.infer_realtime(args.get("obs", {}),
-                        prev_action_chunk=args.get("prev_action_chunk"),
+                        prev_action_chunk=args.get("prefix_actions"),
                         inference_delay=args.get("inference_delay", 0),
                         prefix_attention_horizon=args.get("prefix_attention_horizon", 0),
                         prefix_attention_schedule=args.get("prefix_attention_schedule", None),

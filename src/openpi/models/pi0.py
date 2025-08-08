@@ -332,6 +332,7 @@ class Pi0(_model.BaseModel):
         prefix_actions: jax.Array,
         inference_delay: int,
         prefix_attention_horizon: int,
+        prefix_attention_schedule,
         max_guidance_weight: float,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
@@ -347,13 +348,14 @@ class Pi0(_model.BaseModel):
         prefix_actions = prefix_actions[None, ...]
         prefix_actions = jnp.concatenate([prefix_actions, jnp.zeros((batch_size, self.action_horizon, self.action_dim-prefix_actions.shape[-1]))], axis=2)
 
+
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def get_prefix_weights(start: int, end: int, total: int, schedule: PrefixAttentionSchedule) -> jax.Array:
+        def get_prefix_weights(start: int, end: int, total: int, schedule) -> jax.Array:
             """With start=2, end=6, total=10, the output will be:
             1  1  4/5 3/5 2/5 1/5 0  0  0  0
                 ^              ^
@@ -379,7 +381,7 @@ class Pi0(_model.BaseModel):
             return jnp.where(jnp.arange(total) >= end, 0, w)
 
         def pinv_corrected_velocity(
-            v_t_fn: Callable, # ([ah ad], float) -> [ah ad]
+            v_t_fn, # ([ah ad], float) -> [ah ad]
             x_t: jax.Array, # [b ah ad]
             t: float,
             prefix_actions: jax.Array, # [b ah ad]
@@ -397,7 +399,14 @@ class Pi0(_model.BaseModel):
                     return x_t - v_t * t, v_t
 
                 x_0, vjp_fun, v_t = jax.vjp(denoiser, x_t, has_aux=True)
+                # print(f"x_0: {x_0.shape}, v_t: {v_t.shape}")
+                # print(f"x_0: {x_0[:][0]}, y: {y[:][0]}")
+                # jax.debug.print("x_0 shape = {x}", x=x_0.shape)
+                # jax.debug.print("y shape = {y}", y=y.shape)
+                # jax.debug.print("x_0[0] = {x}", x=x_0[0])
+                # jax.debug.print("y[0] = {y}", y=y[0])
                 error = (y - x_0) * get_prefix_weights(inference_delay, prefix_attention_horizon, prefix_actions.shape[1], 'exp')[:, None]
+                # jax.debug.print("error mean = {x}", x=jnp.mean(jnp.abs(error)))
                 pinv_correction = vjp_fun(error)[0]
                 # constants from paper
                 inv_r2 = (t**2 + (1 - t) ** 2) / (t**2)
@@ -454,4 +463,18 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, rtc_step, (noise, 1.0))
+        # jax.debug.print("x_0, joint 0 = {x}", x=x_0[0][0])
+        # jax.debug.print(
+        #     "x[{b}, :, {j}] = {x}",
+        #     b=0,
+        #     j=0,
+        #     x=x_0[0, :, 0]  
+        # )
+        # jax.debug.print(
+        #     "pre[{b}, :, {j}] = {x}",
+        #     b=0,
+        #     j=0,
+        #     x=prefix_actions[0, :, 0]          # 关键切片：batch 固定、时间全取、关节固定
+        # )
+        # jax.debug.print("previx_actions, joint 0 = {x}", x=prefix_actions[0][0])
         return x_0

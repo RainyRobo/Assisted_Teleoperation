@@ -377,4 +377,4 @@ episode_i.hdf5:
             - cam_right_wrist
 '''
 if __name__ == "__main__":
-    data_transform("/data/teleop/uncap_pen_mcap", 219, "/home/research1/data/uncap_pen_hdf5")
+    data_transform("/data/liuyu/fold_clothes_mcap", 25, "/home/research1/data/fold_clothes_hdf5")
