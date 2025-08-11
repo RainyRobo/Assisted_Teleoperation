@@ -1,0 +1,5 @@
+<launch>
+    <node pkg="dual_agent" type="step_inference.py" name="step_inference" output="screen">
+        <param name="debug" value="true" />
+    </node>
+</launch>

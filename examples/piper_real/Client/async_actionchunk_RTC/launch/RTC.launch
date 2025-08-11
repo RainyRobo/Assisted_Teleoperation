@@ -1,0 +1,19 @@
+<launch>
+    <!-- Launch the inference node -->
+    <node pkg="dual_agent" type="rtc_inference.py" name="inference_node" output="screen">
+        <!-- Optional parameters for inference node -->
+        <param name="policy_host" value="192.168.2.250" />
+        <param name="policy_port" value="8000" />
+        <param name="img_size" value="[224, 224]" />
+    </node>
+
+    <!-- Launch the execution node -->
+    <node pkg="dual_agent" type="rtc_execution.py" name="execution_node" output="screen">
+        <!-- Optional parameters for execution node -->
+        <param name="inference_loop" value="1" />
+        <param name="interpolate_step" value="0" />
+        <param name="inference_step" value="5" />
+        <param name="save_debug_images" value="false" />
+        <param name="max_steps" value="1000" />
+    </node>
+</launch>
