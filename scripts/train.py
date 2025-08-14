@@ -136,7 +136,7 @@ def init_train_state(
 
 @at.typecheck
 def train_step(
-    config: _config.TrainConfig,
+    config: _config.TrainConfig, 
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
@@ -146,7 +146,10 @@ def train_step(
 
     @at.typecheck
     def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+        model: _model.BaseModel, 
+        rng: at.KeyArrayLike,
+        observation: _model.Observation, #
+        actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
@@ -211,6 +214,7 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # TODO
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
@@ -228,8 +232,8 @@ def main(config: _config.TrainConfig):
     # 数据迭代器：
     data_iter = iter(data_loader)
     batch = next(data_iter)
-    logging.info(f"Current batch contains: {batch}")
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    # logging.info(f"Current batch contains: {batch}")
+    # logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
     images_to_log = [

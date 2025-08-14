@@ -176,7 +176,10 @@ class Pi0(_model.BaseModel):
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
+        
+        # TODO add
         ar_mask = []
+        
         tokens = []
         # embed images
         for name in obs.images:
@@ -207,14 +210,19 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"]
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
         tokens = []
         # add a single state token
-        state_token = self.state_proj(obs.state)[:, None, :]
+        # state_token shape: (28, 1, 1024)
+        state_token = self.state_proj(obs.state)[:, None, :] # [b,s] -> [b, 1, s:32] -> [b,1,e]
         tokens.append(state_token)
+        
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         # image/language inputs do not attend to state or actions
         ar_mask += [True]
@@ -224,8 +232,11 @@ class Pi0(_model.BaseModel):
         # mix timestep + action information using an MLP
         action_tokens = self.action_in_proj(noisy_actions)
         time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+        
+        # 把噪声强度 t 和 加噪动作 x_t 混在一起编码，确保明白动作是多大噪声下的样子
         action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
         action_time_tokens = self.action_time_mlp_in(action_time_tokens)
+        # swish 激活函数
         action_time_tokens = nnx.swish(action_time_tokens)
         action_time_tokens = self.action_time_mlp_out(action_time_tokens)
         tokens.append(action_time_tokens)
@@ -239,28 +250,55 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation, 
+        actions: _model.Actions, 
+        *, 
+        train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
+        
+        #TODO make the noise and time random
+        noise = jax.random.normal(noise_rng, actions.shape) # noise (28, 50, 32)
+        
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+        
+        # ground truth!
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
+        # prefix_tokens including images and language: jnp.concatenate(img.emb, lang.emb,axis=1)
+        # prefix_tokens (28, 816, 2048)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        
+        #suffix_tokens including state and action_time token
+        # suffix_tokens (28, 51, 1024)
         suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)
+        
+        # (b,images+language+state+action_time,emb)
+        # input_mask (28, 867)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        
+        # ar_mask (867,)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
+        
+        # suffix_out (10, 51, 1024)
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
         )
+        
+        # suffix_out (10, 51, 1024)-> v_t (10, 50, 32)
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
@@ -272,12 +310,15 @@ class Pi0(_model.BaseModel):
         observation: _model.Observation,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
-    ) -> _model.Actions:
+    ) -> _model.Actions: # (batch_size, action_horizon, action_dim)
+        
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
-        dt = -1.0 / num_steps
+        # dt = -0.1
+        dt = -1.0 / num_steps  # from t=1 to t=0 each step = dt
         batch_size = observation.state.shape[0]
+        # TODO
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
@@ -319,17 +360,19 @@ class Pi0(_model.BaseModel):
         def cond(carry):
             x_t, time = carry
             # robust to floating-point error
-            return time >= -dt / 2
+            return time >= -dt / 2 # 
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        x_0, _ = jax.lax.while_loop(cond, # 循环条件
+                                    step, 
+                                    (noise, 1.0))
         return x_0
-    
+     
     @override
     def sample_actions_rtc(
         self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation,
-        prefix_actions: jax.Array,
+        rng: at.KeyArrayLike,    # 随机数生成器的键数组
+        observation: _model.Observation,  
+        prefix_actions: jax.Array, 
         inference_delay: int,
         prefix_attention_horizon: int,
         prefix_attention_schedule,
