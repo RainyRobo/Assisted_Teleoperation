@@ -57,23 +57,35 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 args = msgpack_numpy.unpackb(await websocket.recv())
                 realtime = args.get("realtime", False)
+                guide = args.get("guide", False)
                 # print("AAAAAAAAA: args: ", args.keys())
                 infer_time = time.monotonic()
-                if not realtime:
-                    # If not realtime, we can just use the infer method.
-                    action = self._policy.infer(args)
-                else:
+                if realtime or guide:
                     if "obs" not in args:
                         print("No observations provided for real-time inference.")
-                    else:
+                    if realtime:
                         print("Real-time inference with observations:")
-                    action = self._policy.infer_realtime(args.get("obs", {}),
-                        prev_action_chunk=args.get("prefix_actions"),
-                        inference_delay=args.get("inference_delay", 0),
-                        prefix_attention_horizon=args.get("prefix_attention_horizon", 0),
-                        prefix_attention_schedule=args.get("prefix_attention_schedule", None),
-                        max_guidance_weight=args.get("max_guidance_weight", 1.0),
-                    )
+                        action = self._policy.infer_realtime(args.get("obs", {}),
+                            prev_action_chunk=args.get("prefix_actions"),
+                            inference_delay=args.get("inference_delay", 0),
+                            prefix_attention_horizon=args.get("prefix_attention_horizon", 0),
+                            prefix_attention_schedule=args.get("prefix_attention_schedule", None),
+                            max_guidance_weight=args.get("max_guidance_weight", 1.0),
+                        )
+                    if guide:
+                        print("Guidance inference with observations:")
+                        action = self._policy.infer_guide(args.get("obs", {}),
+                            prev_action_chunk=args.get("prefix_actions"),
+                            inference_delay=args.get("inference_delay", 0),
+                            prefix_attention_horizon=args.get("prefix_attention_horizon", 0),
+                            prefix_attention_schedule=args.get("prefix_attention_schedule", None),
+                            max_guidance_weight=args.get("max_guidance_weight", 5.0),
+                        )
+                else:
+                    # If not realtime, we can just use the infer method.
+                    print(args)
+                    action = self._policy.infer(args)
+                
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

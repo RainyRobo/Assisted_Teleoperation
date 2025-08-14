@@ -151,8 +151,13 @@ def train_step(
         observation: _model.Observation, #
         actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        # original loss
+        # chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        
+        # human assistance loss
+        chunked_loss = model.compute_HumAction_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
+    
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch

@@ -35,6 +35,7 @@ IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",
     "right_wrist_0_rgb",
+    # "low_0_rgb"
 )
 
 
@@ -75,7 +76,9 @@ IMAGE_RESOLUTION = (224, 224)
 #
 @at.typecheck
 @struct.dataclass
-class Observation(Generic[ArrayT]):
+# Generic: 泛型类; [ArrayT] 是一个类型变量，表示这个泛型类可以接受任何类型作为参数
+# 常见做法：让同一套代码既能接收 numpy.ndarray、jax.numpy.ndarray、torch.Tensor 等不同后端的张量。
+class Observation(Generic[ArrayT]): 
     """Holds observations, i.e., inputs to the model.
 
     See `Observation.from_dict` to see the expected dictionary form. This is the format
