@@ -235,10 +235,10 @@ def data_transform(path, episode_num, save_path):
                 print(f"Episode {i} has only {min_length} frames, less than required {fixed_frame_count}. Skipping.")
                 continue
 
-            camera_high = camera_high[:fixed_frame_count]
-            camera_low = camera_low[:fixed_frame_count]
-            camera_left_wrist = camera_left_wrist[:fixed_frame_count]
-            camera_right_wrist = camera_right_wrist[:fixed_frame_count]
+            camera_high = camera_high[:min_length]
+            camera_low = camera_low[:min_length]
+            camera_left_wrist = camera_left_wrist[:min_length]
+            camera_right_wrist = camera_right_wrist[:min_length]
 
 
             for j in range(len(camera_high)):

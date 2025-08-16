@@ -196,7 +196,7 @@ def load_raw_episode_data(
 def populate_dataset(
     dataset: LeRobotDataset,
     hdf5_files: list[Path],
-    task: str = "pen_uncap",
+    task: str = "stack block",
     episodes: list[int] | None = None,
 ) -> LeRobotDataset:
     if episodes is None:
@@ -212,7 +212,7 @@ def populate_dataset(
             frame = {
                 "observation.state": state[i],
                 "action": action[i],
-                "task": "pen_uncap"
+                "task": "stack block"
             }
 
             for camera, img_array in imgs_per_cam.items():
