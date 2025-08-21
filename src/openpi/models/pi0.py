@@ -178,12 +178,9 @@ class Pi0(_model.BaseModel):
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
-        
-        # TODO add
         ar_mask = []
-        
         tokens = []
-        # embed images
+        # 1. embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
@@ -198,7 +195,7 @@ class Pi0(_model.BaseModel):
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
-        # add language (aka tokenized inputs)
+        # 2. embed language
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
@@ -217,18 +214,20 @@ class Pi0(_model.BaseModel):
         noisy_actions: _model.Actions,
         timestep: at.Float[at.Array, " b"]
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        # 
         input_mask = []
         ar_mask = []
         tokens = []
-        # add a single state token
-        # state_token shape: (28, 1, 1024)
+        # 1. add a single state token
+        # state_token shape: (b:28, 1, emb:1024)
         state_token = self.state_proj(obs.state)[:, None, :] # [b,s] -> [b, 1, s:32] -> [b,1,e]
         tokens.append(state_token)
         
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         # image/language inputs do not attend to state or actions
         ar_mask += [True]
-
+        
+        # 2. add action tokens
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         # mix timestep + action information using an MLP
@@ -249,64 +248,13 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+    
+    # @at.typecheck
+    # def Human_Action_Encoder():
 
-    @override
-    def compute_loss(
-        self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation, 
-        actions: _model.Actions, 
-        *, 
-        train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
-        
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-
-        batch_shape = actions.shape[:-2]
-        
-        # noise (28, 50, 32)
-        noise = jax.random.normal(noise_rng, actions.shape) 
-        
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        
-        # ground truth!
-        u_t = noise - actions
-
-        # one big forward pass of prefix + suffix at once
-        # prefix_tokens including images and language: jnp.concatenate(img.emb, lang.emb,axis=1)
-        # prefix_tokens (28, 816, 2048)
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        
-        #suffix_tokens including state and action_time token
-        # suffix_tokens (28, 51, 1024)
-        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)
-        
-        # (b,images+language+state+action_time,emb)
-        # input_mask (28, 867)
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        
-        # ar_mask (867,)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        
-        attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        
-        # suffix_out (10, 51, 1024)
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
-        )
-        
-        # suffix_out (10, 51, 1024)-> v_t (10, 50, 32)
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
     
     @override
-    def compute_HumAction_loss(
+    def compute_loss(
         self,
         rng: at.KeyArrayLike,
         observation: _model.Observation, 
