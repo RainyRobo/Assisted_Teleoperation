@@ -12,6 +12,8 @@ import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
+import openpi.policies.aloha_policy as _aloha_policy
+
 
 
 @dataclasses.dataclass
@@ -65,12 +67,21 @@ def create_trained_policy(
 
     return _policy.Policy(
         model,
+        # transforms=[
+        #     *repack_transforms.inputs,
+        #     transforms.InjectDefaultPrompt(default_prompt),
+        #     *data_config.data_transforms.inputs,
+        #     transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        #     *data_config.model_transforms.inputs,
+        # ],
         transforms=[
-            *repack_transforms.inputs,
-            transforms.InjectDefaultPrompt(default_prompt),
-            *data_config.data_transforms.inputs,
-            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.repack_transforms.inputs,
+            # *data_config.data_transforms.inputs,
+            _aloha_policy.AlohaInputs_Extra(),
+            data_config.data_transforms.inputs[-1],
+            transforms.Normalize_Extra(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
+            
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,

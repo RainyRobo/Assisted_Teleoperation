@@ -13,87 +13,8 @@ import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
-from openpi.models.extra_process import HumanChunkEncoderBN as _human_chunk_enc
-from openpi.models.extra_process import StateSeqEncoderToChunk as _state_seq_enc
-from openpi.models.extra_process import take_prev_window_pad0 as _take_prev_window_pad0
-from openpi.models.extra_process import CrossAttnPool, GaussianHeads
-
 
 logger = logging.getLogger("openpi")
-def sliding_chunks_with_mask(
-    x: jnp.ndarray,
-    window: int,
-    stride: int = 1,
-    pad: bool = False,
-    merge_batch: bool = False,
-):
-    if x.ndim == 2:
-        x = x[None, ...] 
-        squeeze_out = True
-    elif x.ndim == 3:
-        squeeze_out = False
-    else:
-        raise AssertionError(f"x should be [T, D] or [B, T, D], got {x.shape}")
-
-    B, T0, D = x.shape
-    T = T0
-    pad_len = 0
-
-    if pad:
-        if T < window:
-            pad_len = window - T
-        else:
-            remainder = (T - window) % stride
-            pad_len = 0 if remainder == 0 else (stride - remainder)
-        if pad_len > 0:
-            x = jnp.pad(x, ((0, 0), (0, pad_len), (0, 0)))
-            T = x.shape[1]
-
-    # 没法取窗口时，返回空
-    if T < window:
-        empty_chunks = jnp.empty((B, 0, window, D), dtype=x.dtype)
-        empty_mask = jnp.empty((B, 0, window), dtype=jnp.bool_)
-        if squeeze_out:
-            return empty_chunks[0], empty_mask[0]
-        return empty_chunks, empty_mask
-
-    N = 1 + (T - window) // stride
-    starts = jnp.arange(N) * stride  # [N]
-
-    # 单个样本上抽取所有 chunk: [T, D] -> [N, window, D]
-    def chunks_for_one_batch(x1):
-        def take(start):
-            return jax.lax.dynamic_slice_in_dim(x1, start, window, axis=0)  # [window, D]
-        return jax.vmap(take)(starts)
-
-    # 对批次做 vmap: [B, T, D] -> [B, N, window, D]
-    chunks = jax.vmap(chunks_for_one_batch)(x)
-
-    # 生成有效位掩码（对所有 batch 相同；如果每个样本 T 不同，需要额外传入长度向量来做逐样本 mask）
-    valid_vec = (
-        jnp.concatenate(
-            [jnp.ones((T0,), dtype=jnp.bool_), jnp.zeros((pad_len,), dtype=jnp.bool_)],
-            axis=0,
-        )
-        if pad else jnp.ones((T,), dtype=jnp.bool_)
-    )
-
-    def take_mask(start):
-        return jax.lax.dynamic_slice_in_dim(valid_vec, start, window, axis=0)  # [window]
-
-    base_mask = jax.vmap(take_mask)(starts)             # [N, window]
-    mask = jnp.broadcast_to(base_mask, (B, N, window))  # [B, N, window]
-
-    # 是否展平批次和块数
-    if merge_batch:
-        chunks = chunks.reshape(B * N, window, D)
-        mask = mask.reshape(B * N, window)
-
-    # 如果输入是 [T, D]，去掉批次维
-    if squeeze_out and not merge_batch:
-        return chunks[0], mask[0]
-    return chunks, mask
-
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -143,8 +64,9 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+
 @dataclasses.dataclass(frozen=True)
-class Pi0Config(_model.BaseModelConfig):
+class Pi0ExtraConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
@@ -174,13 +96,11 @@ class Pi0Config(_model.BaseModelConfig):
                     "base_0_rgb": image_spec,
                     "left_wrist_0_rgb": image_spec,
                     "right_wrist_0_rgb": image_spec,
-                    "low_0_rgb": image_spec  # 新增
                 },
                 image_masks={
                     "base_0_rgb": image_mask_spec,
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
-                    "low_0_rgb":image_mask_spec
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
@@ -217,18 +137,13 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
-        
-        keep_new_modules = nnx_utils.PathRegex(
-            r".*(human_action_emd|state_emd|cross_pool|gauss).*"
-        )
-        filters.append(nnx.Not(keep_new_modules))
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
 
 
-class Pi0(_model.BaseModel):
-    def __init__(self, config: Pi0Config, rngs: nnx.Rngs):
+class Pi0Extra(_model.BaseModel):
+    def __init__(self, config: Pi0ExtraConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -256,37 +171,18 @@ class Pi0(_model.BaseModel):
         self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
-        
-        self.human_action_emd = _human_chunk_enc(
-            in_dim=config.action_dim,
-            emb_dim=action_expert_config.width,
-            num_heads=4,
-            dropout_rate=0.2,
-            use_chunk_attn=True,
-            reduce='cls', rngs=rngs
-        )
-        
-        self.state_emd = _state_seq_enc(
-            in_dim=config.action_dim,
-            emb_dim=action_expert_config.width,
-            num_heads=4, use_self_attn=True, reduce='attn',
-            rngs=rngs
-        )
-        
-        self.cross_pool = CrossAttnPool(emb_dim=action_expert_config.width,
-                                num_heads=4, dropout_rate=0.0, rngs=rngs)
-
-        self.gauss = GaussianHeads(emb_dim=action_expert_config.width,
-                                out_dim=config.action_dim, rngs=rngs)
 
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
+        
+        # TODO add
         ar_mask = []
+        
         tokens = []
-        # 1. embed images
+        # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
@@ -301,7 +197,7 @@ class Pi0(_model.BaseModel):
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
-        # 2. embed language
+        # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
@@ -320,20 +216,18 @@ class Pi0(_model.BaseModel):
         noisy_actions: _model.Actions,
         timestep: at.Float[at.Array, " b"]
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
-        # 
         input_mask = []
         ar_mask = []
         tokens = []
-        # 1. add a single state token
-        # state_token shape: (b:28, 1, emb:1024)
+        # add a single state token
+        # state_token shape: (28, 1, 1024)
         state_token = self.state_proj(obs.state)[:, None, :] # [b,s] -> [b, 1, s:32] -> [b,1,e]
         tokens.append(state_token)
         
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         # image/language inputs do not attend to state or actions
         ar_mask += [True]
-        
-        # 2. add action tokens
+
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         # mix timestep + action information using an MLP
@@ -354,11 +248,7 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
-    
-    # @at.typecheck
-    # def Human_Action_Encoder():
 
-    
     @override
     def compute_loss(
         self,
@@ -375,8 +265,8 @@ class Pi0(_model.BaseModel):
 
         batch_shape = actions.shape[:-2]
         
-        # noise (28, 50, 32)
-        noise = jax.random.normal(noise_rng, actions.shape) 
+        #TODO make the noise and time random
+        noise = jax.random.normal(noise_rng, actions.shape) # noise (28, 50, 32)
         
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
@@ -413,83 +303,31 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
-    
 
+    
     @override
     def compute_loss_extra(
         self,
         rng: at.KeyArrayLike,
-        observation: _model.Observation,
-        actions: _model.Actions,
+        observation: _model.Observation, 
+        actions: _model.Actions, 
         human_action: dict,
         his_state: dict,
-        *,
-        train: bool = False,
+        *, 
+        train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-
-        preprocess_rng, eps_rng, time_rng = jax.random.split(rng, 3)
-
+        
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
-        # ---- human -> (B,N,E) ----
-        human_action_data = human_action["data"]                    # [B, Th, D]
-        human_chunks, human_mask = sliding_chunks_with_mask(
-            human_action_data, window=80, stride=10, pad=True
-        )                                                           # [B,N,80,D], [B,N,80]
-        human_bn_emb, chunk_mask = self.human_action_emd(
-            human_chunks, human_mask, stride=10, deterministic=not train
-        )                                                           # [B,N,E], [B,N]
-
-        # ---- his_state -> (B,1,E) ----
-        his_state_data = his_state["data"]                          # [B, Ts, D]
-        his_idx        = his_state["curr_id"]                           # [B]
-        his_win, his_win_mask = _take_prev_window_pad0(
-            his_state_data, his_idx, window=50
-        )                                                           # [B,50,D], [B,50]
-        state_chunk_emb, _ = self.state_emd(
-            his_win, his_win_mask, deterministic=not train
-        )                                                           # [B,1,E]
-
-        # ---- Cross-Attn(Q=state, KV=human) -> ctx ----
-        ctx, attn = self.cross_pool(
-            q=state_chunk_emb, kv=human_bn_emb, kv_mask=chunk_mask, deterministic=not train
-        )                                                           # ctx: [B,1,E]
-
-        # ---- 高斯头 -> mu/logvar -> 采样噪声 ----
-        mu, logvar = self.gauss(ctx)                                # [B,D], [B,D]
-        eps   = jax.random.normal(eps_rng, mu.shape, dtype=mu.dtype)
-        noise = mu + jnp.exp(0.5 * logvar) * eps                 # [B,D]
-
-        # print("noise:", noise.shape)
-
-
-        # ---- 采样时间 & 构造 x_t / 目标 u_t ----
-        B = actions.shape[0]
-        time = jax.random.beta(time_rng, 1.5, 1.0, (B,)) * 0.999 + 0.001   # [B]
-        t = time[..., None, None]                                          # [B,1,1]
-
-        # actions: [B, ah, D]  -> 广播到时间维
-        x_t = t * noise[:, None, :] + (1.0 - t) * actions                  # [B, ah, D]
-        u_t = noise[:, None, :] - actions                                  # [B, ah, D]
-
-        # ---- 前缀/后缀嵌入 & LLM 前向 ----
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)          # [B, P, E*]
-        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)  # [B, ah+1, E]
-
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)                     # [B, P+S]
-        ar_mask    = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)               # [P+S]
-        attn_mask  = make_attn_mask(input_mask, ar_mask)                                     # [B, S, P+S] or impl-specific
-        positions  = jnp.cumsum(input_mask.astype(jnp.int32), axis=1) - 1                    # [B, P+S]
-
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens],
-            mask=attn_mask,
-            positions=positions,
-        )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])                     # [B, ah, D]
-
-        # ---- per-step MSE（外层再取 mean 成标量）----
-        return jnp.mean((v_t - u_t) ** 2, axis=-1)                                           # [B, ah]
+        batch_shape = actions.shape[:-2]
+        human_action_data = human_action["data"]
+        his_state_data = his_state["data"]
+        
+        
+        return -1
+        
 
     @override
     def sample_actions(
@@ -694,92 +532,106 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, rtc_step, (noise, 1.0))
-        # jax.debug.print("x_0, joint 0 = {x}", x=x_0[0][0])
-        # jax.debug.print(
-        #     "x[{b}, :, {j}] = {x}",
-        #     b=0,
-        #     j=0,
-        #     x=x_0[0, :, 0]  
-        # )
-        # jax.debug.print(
-        #     "pre[{b}, :, {j}] = {x}",
-        #     b=0,
-        #     j=0,
-        #     x=prefix_actions[0, :, 0]          # 关键切片：batch 固定、时间全取、关节固定
-        # )
-        # jax.debug.print("previx_actions, joint 0 = {x}", x=prefix_actions[0][0])
         return x_0
      
     @override
-    def sample_actions_human(
+    def sample_actions_guide(
         self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation,
-        human_action: dict,
-        his_state: dict,
+        rng: at.KeyArrayLike,    # 随机数生成器的键数组
+        observation: _model.Observation,  
+        prefix_actions: jax.Array, 
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule,
+        max_guidance_weight: float,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
-    ) -> _model.Actions: # (batch_size, action_horizon, action_dim)
+    ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
-        # dt = -0.1
-        dt = -1.0 / num_steps  # from t=1 to t=0 each step = dt
+        dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
-        # TODO
-        # noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
-        # ---- human -> (B,N,E) ----
-        human_action_data = human_action["data"]                    # [B, Th, D]
-        # print("shape of human: ", human_action_data.shape)
-        human_chunks, human_mask = sliding_chunks_with_mask(
-            human_action_data, window=80, stride=10, pad=True
-        )                                                  # [B,N,80,D], [B,N,80]
-        # human_chunks = human_chunks[None, :]
-        # human_mask = human_mask[None, :]
-        print(human_chunks.shape)
-        # 将human_chunks最后一维 扩展到32
-        # human_chunks = jnp.pad(human_chunks, ((0,0), (0,0), (0,0), (0,0), (0,32-human_chunks.shape[-1],0)))
-        human_bn_emb, chunk_mask = self.human_action_emd(
-            human_chunks, human_mask, stride=10, deterministic=True
-        )                                                           # [B,N,E], [B,N]
-
-        # ---- his_state -> (B,1,E) ----
-        his_state_data = his_state["data"]                          # [B, Ts, D]
-        his_idx        = his_state["curr_id"]                           # [B]
-        his_win, his_win_mask = _take_prev_window_pad0(
-            his_state_data, his_idx, window=50
-        )
+        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
         
-        # his_win = his_win[None, :]
-        # his_win_mask = his_win_mask[None, :]
-        state_chunk_emb, _ = self.state_emd(
-            his_win, his_win_mask, deterministic=True
-        )                                                           # [B,1,E]
+        # Add a batch dim to prefix_actions # e.g. (30, 14) -> (1, 30, 32)
+        prefix_actions = prefix_actions[None, ...]
+        prefix_actions = jnp.concatenate([prefix_actions, jnp.zeros((batch_size, self.action_horizon, self.action_dim-prefix_actions.shape[-1]))], axis=2)
 
-        # ---- Cross-Attn(Q=state, KV=human) -> ctx ----
-        ctx, attn = self.cross_pool(
-            q=state_chunk_emb, kv=human_bn_emb, kv_mask=chunk_mask, deterministic=True
-        )                                                           # ctx: [B,1,E]
 
-        # ---- 高斯头 -> mu/logvar -> 采样噪声 ----
-        mu, logvar = self.gauss(ctx)                                # [B,D], [B,D]
-        eps   = jax.random.normal(rng, mu.shape, dtype=mu.dtype)
-        noise = mu + jnp.exp(0.5 * logvar) * eps
-        jax.debug.print("mu = {x}", x=mu)
-        jax.debug.print("logvar = {x}", x=logvar)
-        
-        # noise = noise[:, None, :].repeat(1, 50, 1) 
-        noise = jnp.tile(noise[:, None, :], (1, 50, 1)) 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        def get_prefix_weights(start: int, end: int, total: int, schedule) -> jax.Array:
+            """With start=2, end=6, total=10, the output will be:
+            1  1  4/5 3/5 2/5 1/5 0  0  0  0
+                ^              ^
+                start           end
+            `start` (inclusive) is where the chunk starts being allowed to change. `end` (exclusive) is where the chunk stops
+            paying attention to the prefix. if start == 0, then the entire chunk is allowed to change. if end == total, then the
+            entire prefix is attended to.
+
+            `end` takes precedence over `start` in the sense that, if `end < start`, then `start` is pushed down to `end`. Thus,
+            if `end` is 0, then the entire prefix will always be ignored.
+            """
+            start = jnp.minimum(start, end)
+            if schedule == "ones":
+                w = jnp.ones(total)
+            elif schedule == "zeros":
+                w = (jnp.arange(total) < start).astype(jnp.float32)
+            elif schedule == "linear" or schedule == "exp":
+                w = jnp.clip((start - 1 - jnp.arange(total)) / (end - start + 1) + 1, 0, 1)
+                if schedule == "exp":
+                    w = w * jnp.expm1(w) / (jnp.e - 1)
+            else:
+                raise ValueError(f"Invalid schedule: {schedule}")
+            return jnp.where(jnp.arange(total) >= end, 0, w)
+
+        def pinv_corrected_velocity(
+            v_t_fn, # ([ah ad], float) -> [ah ad]
+            x_t: jax.Array, # [b ah ad]
+            t: float,
+            prefix_actions: jax.Array, # [b ah ad]
+            inference_delay: int,
+            prefix_attention_horizon: int,
+            max_guidance_weight: float,
+        ) -> jax.Array: # [b ah ad]
+            @jax.vmap
+            def _pinv_corrected_velocity(
+                x_t: jax.Array, # [ah ad]
+                y: jax.Array, # [ah ad]
+            ) -> jax.Array: # [ah ad]
+                def denoiser(x_t: jax.Array) -> tuple[jax.Array, jax.Array]: # [ah ad]
+                    v_t = v_t_fn(x_t, t)
+                    return x_t - v_t * t, v_t
+
+                x_0, vjp_fun, v_t = jax.vjp(denoiser, x_t, has_aux=True)
+                weights = get_prefix_weights(inference_delay, prefix_attention_horizon, prefix_actions.shape[1], 'exp')[:, None]
+                # 设置将weights翻转过来，使得越往后的权重越大
+                error = (y - x_0) * jnp.flip(weights, axis=0) 
+                pinv_correction = vjp_fun(error)[0]
+                # constants from paper
+                inv_r2 = (t**2 + (1 - t) ** 2) / (t**2)
+                c = jnp.nan_to_num(t / (1 - t), posinf=max_guidance_weight)
+                guidance_weight = jnp.minimum(c * inv_r2, max_guidance_weight)
+                jax.debug.print(f"guidance_weight: {guidance_weight}")
+                return v_t - guidance_weight * pinv_correction
+
+            return _pinv_corrected_velocity(x_t, prefix_actions)
+
+        def v_t_step(
+                x_t: jax.Array, # [ah ad]
+                time: jax.Array, # []
+                ):
+            # TODO: find better way to support jax.vmap
+            x_t = x_t[None, ...]
+            time = time[None, ...]
+
             suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_t, time
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -804,14 +656,17 @@ class Pi0(_model.BaseModel):
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+            return v_t[0, ...] # TODO: remove this since it's not super vectorized
+
+        def rtc_step(carry):
+            x_t, time = carry
+            guided_vt = pinv_corrected_velocity(v_t_step, x_t, time, prefix_actions, inference_delay, prefix_attention_horizon, max_guidance_weight)
+            return x_t + dt * guided_vt, time + dt
 
         def cond(carry):
             x_t, time = carry
             # robust to floating-point error
-            return time >= -dt / 2 # 
+            return time >= -dt / 2
 
-        x_0, _ = jax.lax.while_loop(cond, # 循环条件
-                                    step, 
-                                    (noise, 1.0))
+        x_0, _ = jax.lax.while_loop(cond, rtc_step, (noise, 1.0))
         return x_0

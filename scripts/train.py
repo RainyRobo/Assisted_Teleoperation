@@ -139,7 +139,7 @@ def train_step(
     config: _config.TrainConfig, 
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation, _model.Actions, dict, dict],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
@@ -158,13 +158,29 @@ def train_step(
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
     
+<<<<<<< HEAD
+=======
+    @at.typecheck
+    def loss_fn_extra(
+        model: _model.BaseModel, 
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        human_action: dict,
+        his_state: dict,
+    ):
+        # print("AAAAAAAAAAAAAAAAAA start")
+        chunked_loss = model.compute_loss_extra(rng, observation, actions, human_action, his_state, train=True)
+        return jnp.mean(chunked_loss)
+>>>>>>> b27853e (conditional noise generation)
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
+    observation, actions, human_action, his_state = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    # loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    loss, grads = nnx.value_and_grad(loss_fn_extra, argnums=diff_state)(model, train_rng, observation, actions, human_action, his_state)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -250,7 +266,9 @@ def main(config: _config.TrainConfig):
     # 数据迭代器：
     data_iter = iter(data_loader)
     batch = next(data_iter)
-    # logging.info(f"Current batch contains: {batch}")
+    # # _obs, _action, _human, _state = batch
+    # logging.info(f"Current batch contains: {_human}")
+    # logging.info(f"state: {_state}")
     # logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
@@ -263,7 +281,7 @@ def main(config: _config.TrainConfig):
     # 初始化训练
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    # logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)

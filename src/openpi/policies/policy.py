@@ -33,6 +33,8 @@ class Policy(BasePolicy):
     ):
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
         self._sample_rtc_actions = nnx_utils.module_jit(model.sample_actions_rtc)
+        # self._sample_guide_actions = nnx_utils.module_jit(model.sample_actions_guide)
+        self._sample_actions_human = nnx_utils.module_jit(model.sample_actions_human)
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._rng = rng or jax.random.key(0)
@@ -46,14 +48,14 @@ class Policy(BasePolicy):
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
-
         inputs = self._input_transform(inputs)
+
 
         # Make a batch and convert to jax.Array.
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
 
         shapes = jax.tree.map(lambda x: x.shape, inputs)
-        # print("Input shapes3:", shapes)
+        print("Input shapes3:", shapes)
 
         start_time = time.monotonic()
         self._rng, sample_rng = jax.random.split(self._rng)
@@ -169,6 +171,95 @@ class Policy(BasePolicy):
         # outputs["actions"] = _actions
         return outputs
         
+    @override
+    def infer_guide(self, obs, prev_action_chunk, inference_delay, prefix_attention_horizon, prefix_attention_schedule, max_guidance_weight):
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+
+        # Make a batch and convert to jax.Array.
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+
+        shapes = jax.tree.map(lambda x: x.shape, inputs)
+       
+        start_time = time.monotonic()
+        self._rng, sample_rng = jax.random.split(self._rng)
+        actions = self._sample_rtc_actions(sample_rng, _model.Observation.from_dict(inputs), inference_delay=inference_delay,
+                prefix_actions=prev_action_chunk, prefix_attention_horizon=prefix_attention_horizon,
+                prefix_attention_schedule=prefix_attention_schedule, max_guidance_weight=max_guidance_weight, **self._sample_kwargs)
+        # 直接通过推理得到的动作
+        actions_origin = self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs)
+        # print("AAAAA: shape", actions.shape, prev_action_chunk.shape)
+        output_1 = {
+            "state": inputs["state"],
+            "actions": actions,
+        }
+        output_2 = {
+            "state": inputs["state"],
+            "actions": actions_origin,
+        }
+
+        self.num_step += 1
+        # Unbatch and convert to np.ndarray.        # Unbatch and convert to np.ndarray.
+        output_1 = jax.tree.map(lambda x: np.asarray(x[0, ...]), output_1)
+        output_2 = jax.tree.map(lambda x: np.asarray(x[0, ...]), output_2)
+        # _actions = np.asarray(outputs["actions"]]
+        
+        model_time = time.monotonic() - start_time
+        outputs_1 = self._output_transform(output_1)
+        outputs_2 = self._output_transform(output_2)
+        
+        outputs = {}
+        
+        # outputs["state"] = outputs_1["state"]
+        outputs["actions"] = outputs_1["actions"]
+        outputs["actions_origin"] = outputs_2["actions"]
+
+        # print("AAAAA: outputs", outputs["actions"][:, 0], "shape", outputs["actions"].shape)
+        outputs["policy_timing"] = {
+            "infer_ms": model_time * 1000,
+        }
+        # outputs["actions"] = _actions
+        return outputs
+    
+    @override
+    def infer_human(self, obs, human_action, his_state):
+        # print(obs)
+        obs = {**obs, 
+               "human_action": human_action,
+               "his_state": his_state}
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        # print("inputs:", inputs)
+        # print(inputs["human_action"]["data"].shape)
+        # Make a batch and convert to jax.Array.
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+
+        shapes = jax.tree.map(lambda x: x.shape, inputs)
+       
+        start_time = time.monotonic()
+        self._rng, sample_rng = jax.random.split(self._rng)
+        
+        actions = self._sample_actions_human(sample_rng,
+                                             _model.Observation.from_dict(inputs), 
+                                             human_action=inputs["human_action"],
+                                             his_state=inputs["his_state"],
+                                             **self._sample_kwargs)
+        
+        output = {
+            "state": inputs["state"],
+            "actions": actions,
+        }
+        # Unbatch and convert to np.ndarray.        # Unbatch and convert to np.ndarray.
+        output = jax.tree.map(lambda x: np.asarray(x[0, ...]), output)        
+        model_time = time.monotonic() - start_time
+        outputs = self._output_transform(output)
+        
+        # print("AAAAA: outputs", outputs["actions"][:, 0], "shape", outputs["actions"].shape)
+        outputs["policy_timing"] = {
+            "infer_ms": model_time * 1000,
+        }
+        # outputs["actions"] = _actions
+        return outputs
 
     @property
     def metadata(self) -> dict[str, Any]:

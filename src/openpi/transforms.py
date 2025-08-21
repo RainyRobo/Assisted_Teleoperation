@@ -12,6 +12,7 @@ from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
 from openpi.shared import normalize as _normalize
 
+from typing import Any, Literal, Optional, Union
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
 
@@ -97,8 +98,10 @@ class RepackTransform(DataTransformFn):
     structure: at.PyTree[str]
 
     def __call__(self, data: DataDict) -> DataDict:
+        # print(data.keys())
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        # print(flat_item.keys())
+        return jax.tree.map(lambda k: flat_item.get(k, None), self.structure)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,9 +114,70 @@ class InjectDefaultPrompt(DataTransformFn):
         return data
 
 
+# @dataclasses.dataclass(frozen=True)
+# class Normalize(DataTransformFn):
+#     norm_stats: at.PyTree[NormStats] | None
+#     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
+#     use_quantiles: bool = False
+#     # If true, will raise an error if any of the keys in the norm stats are not present in the data.
+#     strict: bool = False
+
+#     def __post_init__(self):
+#         if self.norm_stats is not None and self.use_quantiles:
+#             _assert_quantile_stats(self.norm_stats)
+
+#     def __call__(self, data: DataDict) -> DataDict:
+#         if self.norm_stats is None:
+#             return data
+        
+#         if "his_state" in data and "human_action" in data:
+#             print("BBBBBBBBBBB")
+#             print(self.norm_stats.keys())
+#             self.norm_stats_extra = {
+#                 **self.norm_stats,
+#                 "his_state":   {"data": self.norm_stats["state"]},   # <- 没有 "data" 这层
+#                 "human_action":{"data": self.norm_stats["actions"]},  # <- 同上
+#             }
+
+#         applied_dataset = apply_tree(
+#             data,
+#             self.norm_stats_extra,
+#             self._normalize_quantile if self.use_quantiles else self._normalize,
+#             strict=self.strict,
+#         )
+#         print("AAAAAAAAAAA applied:", applied_dataset.keys())
+#         return applied_dataset
+
+#     def _normalize(self, x, stats: NormStats):
+#         return (x - stats.mean) / (stats.std + 1e-6)
+
+#     def _normalize_quantile(self, x, stats: NormStats):
+#         assert stats.q01 is not None
+#         assert stats.q99 is not None
+#         return (x - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
+
+import dataclasses
+
+def _align_tail(x, v):
+    """把向量 v (D,) reshape 成可与 x 广播的形状 (..., D)。"""
+    # 保留 torch.Tensor 类型；否则转 numpy
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            v = torch.as_tensor(v, dtype=x.dtype, device=x.device)
+        else:
+            v = np.asarray(v)
+    except Exception:
+        v = np.asarray(v)
+    if v.ndim == 0:
+        return v
+    if x.shape[-1] != v.shape[0]:
+        raise ValueError(f"尾维不匹配: x.shape={tuple(x.shape)}, v.shape={tuple(v.shape)}")
+    return v.reshape((1,) * (x.ndim - 1) + (v.shape[0],))
+
 @dataclasses.dataclass(frozen=True)
-class Normalize(DataTransformFn):
-    norm_stats: at.PyTree[NormStats] | None
+class Normalize_Extra(DataTransformFn):
+    norm_stats: Mapping[str, Any] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantiles: bool = False
     # If true, will raise an error if any of the keys in the norm stats are not present in the data.
@@ -127,13 +191,45 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
-        return apply_tree(
+        # 调试打印（避免使用 **kwargs）
+        # print("Normalize keys:", list(self.norm_stats.keys()))
+
+        # 基于当前 batch 构造局部 stats 视图（不要改 self.norm_stats）
+        ns = dict(self.norm_stats)
+
+        # 只有当数据里存在对应结构时，才补齐嵌套 stats 形状
+        if isinstance(data.get("his_state"), dict) and "data" in data["his_state"]:
+            if "state" in ns:
+                ns["his_state"] = {"data": ns["state"]}
+        if isinstance(data.get("human_action"), dict) and "data" in data["human_action"]:
+            if "actions" in ns:
+                ns["human_action"] = {"data": ns["actions"]}
+
+        # 严格模式下：只保留顶层在 data 里出现过的键（避免 apply_tree 因多余键报错）
+        if self.strict:
+            ns = {k: v for k, v in ns.items() if k in data}
+
+        # 应用归一化（应只改有 stats 的叶子，其他键保持原样）
+        applied_dataset = apply_tree(
             data,
-            self.norm_stats,
+            ns,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
 
+        # ---- 关键：保留 his_state/human_action 的非 data 元信息 ----
+        # 如果 apply_tree 只返回了 {"data": ...} 这样的子树，我们把它和原始字典浅合并
+        for k in ("his_state", "human_action"):
+            if isinstance(data.get(k), dict) and isinstance(applied_dataset.get(k), dict):
+                # 用归一化后的字段覆盖原始同名字段（特别是 "data"），其余元信息保留
+                applied_dataset[k] = {**data[k], **applied_dataset[k]}
+
+        # print("Normalize applied keys:", list(applied_dataset.keys()))
+        # print("human actions: keys():", applied_dataset["human_action"].keys())
+        print("applied_dataset: human_action:", applied_dataset["human_action"]["data"].shape)
+        return applied_dataset
+
+    
     def _normalize(self, x, stats: NormStats):
         return (x - stats.mean) / (stats.std + 1e-6)
 
@@ -181,6 +277,14 @@ class ResizeImages(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        return data
+
+@dataclasses.dataclass(frozen=True)
+class ExtraActions(DataTransformFn):
+    def __call__(self, data: DataDict) -> DataDict:
+        data["human_action"] = data["human_action"]
+        data["his_state"] = data["his_state"]
+        # print("extra: ", data["human_action"]["data"].shape)
         return data
 
 

@@ -1,4 +1,4 @@
-"""Compute normalization statistics for a config.
+"""Compute normalization statistics for a config
 
 This script is used to compute the normalization statistics for a given config. It
 will compute the mean and standard deviation of the data in the dataset and save it
@@ -31,6 +31,7 @@ def create_torch_dataloader(
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    # raise NotImplementedError("This is not implemented yet")
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -40,6 +41,8 @@ def create_torch_dataloader(
             RemoveStrings(),
         ],
     )
+    print(f"dataset transformed: keys: {dataset[0].keys()}")
+    
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
         shuffle = True
@@ -87,6 +90,7 @@ def create_rlds_dataloader(
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
+    print("AAAAAAAAAAAAAAA: create data config")
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
@@ -101,6 +105,7 @@ def main(config_name: str, max_frames: int | None = None):
     stats = {key: normalize.RunningStats() for key in keys}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+        print("AAAAAAAAAAAAAAAA: batch: ", batch.keys())
         for key in keys:
             values = np.asarray(batch[key][0])
             stats[key].update(values.reshape(-1, values.shape[-1]))

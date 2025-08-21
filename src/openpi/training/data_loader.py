@@ -14,7 +14,12 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+<<<<<<< HEAD
 import inspect
+=======
+import openpi.policies.aloha_policy as _aloha_policy
+
+>>>>>>> b27853e (conditional noise generation)
 T_co = TypeVar("T_co", covariant=True)
 
 
@@ -124,7 +129,116 @@ class FakeDataset(Dataset):
 
     def __len__(self) -> int:
         return self._num_samples
+    
+class LerobotHumanDataset(lerobot_dataset.LeRobotDataset):
+    def __init__(self, repo_id: str, delta_timestamps: dict[str, list[float]]):
+        super().__init__(repo_id=repo_id, delta_timestamps=delta_timestamps)
 
+        self._actions_all = None
+        self._ep_from = self.episode_data_index["from"].numpy().copy()
+        self._ep_to = self.episode_data_index["to"].numpy().copy()
+        self.max_ep_len = int((self._ep_to - self._ep_from).max())
+        
+        self._state_all = None
+
+    def _ensure_actions_all(self):
+        if self._actions_all is None:
+            from contextlib import nullcontext
+            ctx = self.hf_dataset.formatted_as(type=None) if hasattr(self.hf_dataset, "formatted_as") else nullcontext()
+            with ctx:
+                acts = self.hf_dataset["action"]
+                acts = np.asarray(acts)
+                self._actions_all = torch.as_tensor(acts)
+        return self._actions_all
+    
+    def _ensure_state_all(self):
+        if self._state_all is None:
+            from contextlib import nullcontext
+            ctx = self.hf_dataset.formatted_as(type=None) if hasattr(self.hf_dataset, "formatted_as") else nullcontext()
+            with ctx:
+                states = self.hf_dataset["observation.state"]
+                states = np.asarray(states)
+                self._state_all = torch.as_tensor(states)
+        return self._state_all
+
+    def get_episode_actions(self, ep_idx: int) -> torch.Tensor:
+        actions_all = self._ensure_actions_all()
+        s, e = int(self._ep_from[ep_idx]), int(self._ep_to[ep_idx])
+        # if e <= s:
+        #     print(f"in episode idx {ep_idx}, s {s} >= e {e}")
+        #     print(f"ep_from arr {self._ep_from}, ep_to arr {self._ep_to}")
+        #     raise ValueError
+        
+        return actions_all[s:e]
+    
+    def get_episode_states(self, ep_idx: int) -> torch.Tensor:
+        states_all = self._ensure_state_all()
+        s, e = int(self._ep_from[ep_idx]), int(self._ep_to[ep_idx])
+        return states_all[s:e]
+
+    def _pad_to_max(self, x: torch.Tensor, max_len: int):
+        L = x.shape[0]
+        if L == max_len:
+            return x, torch.ones(max_len, dtype=torch.bool)
+        if L > max_len:
+            raise ValueError(f"Episode length {L} is greater than max length {max_len}")
+        pad_shape = (max_len - L,) + x.shape[1:]
+        pad = x.new_zeros(pad_shape)
+        out = torch.cat([x, pad], dim=0)
+        mask = torch.zeros(max_len, dtype=torch.bool)
+        mask[:L] = True
+        return out, mask
+
+    def __getitem__(self, idx) -> dict:
+        item = self.hf_dataset[idx]
+        ep_idx = item["episode_index"].item()
+
+        # delta窗口（保持原逻辑）
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(idx, ep_idx)
+            query_result = self._query_hf_dataset(query_indices)
+            item = {**item, **padding}
+            for key, val in query_result.items():
+                item[key] = val
+
+        ep_actions = self.get_episode_actions(ep_idx)              # [L_i, A]
+        
+        ep_actions_pad, ep_mask = self._pad_to_max(ep_actions, self.max_ep_len)
+        
+        ep_states = self.get_episode_states(ep_idx)              # [L_i, S]
+        ep_states_pad, ep_states_mask = self._pad_to_max(ep_states, self.max_ep_len)
+
+        item["human_action"] = {
+            "data": ep_actions_pad,                                # [max_L, A]
+            "mask": ep_mask,                                       # [max_L]
+            "length": torch.tensor(ep_actions.shape[0], dtype=torch.int32),
+        }
+        
+        if idx < self._ep_from[ep_idx]:
+            raise ValueError(f"idx {idx} is less than ep_from {self._ep_from[ep_idx]}")
+        # 需要记录对应的state的全部的序列,之后,有一个节选的mask.以及当前状态的id 以及对应的长度
+        item["his_state"] = {
+            "data": ep_states_pad,                                # [max_L, S]
+            "mask": ep_states_mask,                               # [max_L]
+            "length": torch.tensor(ep_states.shape[0], dtype=torch.int32),
+            "curr_id": idx - self._ep_from[ep_idx],
+        }
+
+        # 视频/图像/任务（保持原逻辑）
+        if len(self.meta.video_keys) > 0:
+            current_ts = item["timestamp"].item()
+            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            video_frames = self._query_videos(query_timestamps, ep_idx)
+            item = {**video_frames, **item}
+
+        if self.image_transforms is not None:
+            for cam in self.meta.camera_keys:
+                item[cam] = self.image_transforms(item[cam])
+
+        task_idx = item["task_index"].item()
+        item["task"] = self.meta.tasks[task_idx]
+        return item
 
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
@@ -137,7 +251,7 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
+    dataset = LerobotHumanDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
@@ -146,7 +260,6 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-
     return dataset
 
 
@@ -178,15 +291,27 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
+    # print(f"dataset keys: {dataset[0].keys()}")
+    # # print the dimension of the dataset
+    # print(f"dataset shape: {dataset[0]['human_action']['data'].shape}")
+    # print(f"dataset shape: {dataset[0]['his_state']['data'].shape}")
+    # print(f"dataset shape: {dataset[0]['observation.state'].shape}")
+    # raise ValueError(f"dataset keys: {dataset[0].keys()}")
+    # print(*data_config.data_transforms.inputs)
+    trans_dataset =  TransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            # *data_config.data_transforms.inputs,
+            _aloha_policy.AlohaInputs_Extra(),
+            data_config.data_transforms.inputs[-1],
+            _transforms.Normalize_Extra(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
     )
+    # print("AAAAAAAAA trans dataset:", trans_dataset[0])
+    # print(trans_dataset[0].keys())
+    return trans_dataset
 
 
 def transform_iterable_dataset(
@@ -297,7 +422,7 @@ def create_torch_data_loader(
         seed=seed,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoader_ExtraImpl(data_config, data_loader)
 
 
 def create_rlds_data_loader(
@@ -489,3 +614,16 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+
+class DataLoader_ExtraImpl(DataLoader):
+    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+        self._data_config = data_config
+        self._data_loader = data_loader
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+
+    def __iter__(self):
+        for batch in self._data_loader:
+            yield _model.Observation.from_dict(batch), batch["actions"], batch["human_action"], batch["his_state"]

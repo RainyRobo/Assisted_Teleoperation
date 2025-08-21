@@ -94,6 +94,166 @@ class AlohaInputs(transforms.DataTransformFn):
         return inputs
 
 
+GRIPPER_IDXS = (6, 13)
+
+def _as2d(x: np.ndarray):
+    """Return (arr2d, batched_flag). Accepts rank-1 or rank-2 only."""
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return x[None, :], False
+    if x.ndim == 2:
+        return x, True
+    raise ValueError(f"Expected state/actions to be rank-1 or rank-2, got shape {x.shape}")
+
+def _ensure_mask(mask: np.ndarray, dim: int) -> np.ndarray:
+    """Make sure flip mask length equals the feature dim."""
+    m = np.asarray(mask).reshape(-1)
+    if m.size == dim:
+        return m
+    if m.size < dim:
+        pad = np.ones(dim - m.size, dtype=m.dtype)
+        return np.concatenate([m, pad], axis=0)
+    # m.size > dim
+    return m[:dim]
+
+def _apply_gripper_cols(a2d: np.ndarray, fn, idxs=GRIPPER_IDXS) -> np.ndarray:
+    """Apply fn on the two gripper columns, preserving shape."""
+    cols = np.array(idxs, dtype=int)
+    a2d = a2d.copy()
+    a2d[:, cols] = fn(a2d[:, cols])
+    return a2d
+
+def _decode_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
+    """State decode that works for (D,) or (T, D)."""
+    s = np.asarray(state)
+    if not adapt_to_pi:
+        return s
+
+    s2d, batched = _as2d(s)
+    D = s2d.shape[1]
+    if D < 14:
+        raise ValueError(f"_decode_state expects at least 14 dims (got {D}).")
+
+    # 1) 关节翻转
+    mask = _ensure_mask(_joint_flip_mask(), D)   # shape: (D,)
+    s2d = s2d * mask[None, :]                    # broadcast over T
+
+    # 2) 还原 Aloha runtime 对夹爪的变换
+    s2d = _apply_gripper_cols(s2d, _gripper_to_angular)
+
+    return s2d if batched else s2d[0]
+
+def _encode_actions_inv(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
+    """Inverse action encode that works for (D,) or (T, D)."""
+    a = np.asarray(actions)
+    if not adapt_to_pi:
+        return a
+
+    a2d, batched = _as2d(a)
+    D = a2d.shape[1]
+    if D < 14:
+        raise ValueError(f"_encode_actions_inv expects at least 14 dims (got {D}).")
+
+    # 1) 关节翻转
+    mask = _ensure_mask(_joint_flip_mask(), D)
+    a2d = a2d * mask[None, :]
+
+    # 2) 将夹爪从角度域映回（逆变换）
+    a2d = _apply_gripper_cols(a2d, _gripper_from_angular_inv)
+
+    return a2d if batched else a2d[0]
+
+@dataclasses.dataclass(frozen=True)
+class AlohaInputs_Extra(transforms.DataTransformFn):
+    """Inputs for the Aloha policy.
+    """
+
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    action_dim: int = 32
+
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model.
+    adapt_to_pi: bool = True
+
+    # The expected cameras names. All input cameras must be in this set. Missing cameras will be
+    # replaced with black images and the corresponding `image_mask` will be set to False.
+    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
+
+    def __call__(self, data: dict) -> dict:
+        # print("BBBBBBB:", data)
+        data_ = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
+
+        # ---- 状态 ----
+        # 先做 decode，再做 pad（pad_to_dim 允许 (D,) 或 (T,D) 都可）
+        state = _decode_state(data_["state"], adapt_to_pi=self.adapt_to_pi)
+        state = transforms.pad_to_dim(state, self.action_dim)
+        print(state.shape)
+
+        # ---- 图像 ----
+        in_images = data_["images"]
+        unexpected = set(in_images) - set(self.EXPECTED_CAMERAS)
+        if unexpected:
+            # 以前这里是 raise ValueError；多数数据集会包含额外相机键，建议忽略并告警即可
+            # 你也可以保留原来的报错逻辑，看你流程需要
+            print(f"[AlohaInputs_Extra] Ignoring unexpected cameras: {tuple(unexpected)}")
+
+        if "cam_high" not in in_images:
+            # 如果缺基本相机，尝试选一个已有相机做基准；实在没有就给一个兜底黑图
+            if in_images:
+                base_image = next(iter(in_images.values()))
+            else:
+                base_image = np.zeros((256, 256, 3), dtype=np.uint8)
+        else:
+            base_image = in_images["cam_high"]
+
+        images = {"base_0_rgb": base_image}
+        image_masks = {"base_0_rgb": np.bool_(True)}
+
+        extra_image_names = {
+            "left_wrist_0_rgb": "cam_left_wrist",
+            "right_wrist_0_rgb": "cam_right_wrist",
+            "low_0_rgb": "cam_low",
+        }
+        for dest, source in extra_image_names.items():
+            if source in in_images:
+                images[dest] = in_images[source]
+                image_masks[dest] = np.bool_(True)
+            else:
+                images[dest] = np.zeros_like(base_image)
+                image_masks[dest] = np.bool_(False)
+
+        inputs = {
+            "image": images,
+            "image_mask": image_masks,
+            "state": state,
+        }
+
+        if "actions" in data_:
+            actions = _encode_actions_inv(np.asarray(data_["actions"]), adapt_to_pi=self.adapt_to_pi)
+            inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
+
+        if "prompt" in data_:
+            inputs["prompt"] = data_["prompt"]
+
+        if "his_state" in data_ and "data" in data_["his_state"]:
+            hs = _decode_state(np.asarray(data_["his_state"]["data"]), adapt_to_pi=self.adapt_to_pi)
+            # 若下游需要与 state 同维对齐，请保留这一行；否则可删掉
+            hs = transforms.pad_to_dim(hs, self.action_dim)
+            inputs["his_state"] = {**data_["his_state"], "data": hs}
+        else:
+            inputs["his_state"] = data_.get("his_state", None)
+
+        if "human_action" in data_ and "data" in data_["human_action"]:
+            ha = _encode_actions_inv(np.asarray(data_["human_action"]["data"]), adapt_to_pi=self.adapt_to_pi)
+            # 若下游把 human_action 当作目标或与 actions 对齐计算，请保留这一行；否则可删掉
+            ha = transforms.pad_to_dim(ha, self.action_dim)
+            inputs["human_action"] = {**data_["human_action"], "data": ha}
+            print(inputs["human_action"]["data"].shape)
+        else:
+            inputs["human_action"] = data_.get("human_action", None)
+
+
+        return inputs
 @dataclasses.dataclass(frozen=True)
 class AlohaOutputs(transforms.DataTransformFn):
     """Outputs for the Aloha policy."""

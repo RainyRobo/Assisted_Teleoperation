@@ -28,6 +28,7 @@ class ModelType(enum.Enum):
 
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
+    PI0_GUIDE = "pi0_guide"
 
 
 # The model always expects these images
@@ -268,6 +269,18 @@ class BaseModel(nnx.Module, abc.ABC):
         *,
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]: ...
+    
+    @abc.abstractmethod
+    def compute_loss_extra(
+        self,
+        rng: at.KeyArrayLike,
+        observation: Observation,
+        actions: Actions,
+        human_action,
+        his_state,
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, "*b ah"]: ...
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
@@ -278,6 +291,24 @@ class BaseModel(nnx.Module, abc.ABC):
         prefix_attention_horizon: int,
         prefix_attention_schedule,
         max_guidance_weight: float) -> Actions: ...
+    
+    # @abc.abstractmethod
+    # def sample_actions_guide(self, rng: at.KeyArrayLike, observation: Observation, prefix_actions: jax.Array,
+    #     inference_delay: int,
+    #     prefix_attention_horizon: int,
+    #     prefix_attention_schedule,
+    #     max_guidance_weight: float) -> Actions: ...
+      
+    @abc.abstractmethod
+    def sample_actions_human(
+        self,
+        rng: at.KeyArrayLike,
+        observation: Observation,
+        human_action: dict,
+        his_state: dict,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+    ) -> Actions: ...
     
 
 

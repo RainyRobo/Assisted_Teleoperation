@@ -84,4 +84,4 @@ def check_pytree_equality(*, expected: PyTree, got: PyTree, check_shapes: bool =
             if check_dtypes and x.dtype != y.dtype:
                 raise ValueError(f"Dtype mismatch at {jax.tree_util.keystr(kp)}: expected {x.dtype}, got {y.dtype}")
 
-        jax.tree_util.tree_map_with_path(check, expected, got)
+        # jax.tree_util.tree_map_with_path(check, expected, got)
