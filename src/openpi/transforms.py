@@ -226,7 +226,7 @@ class Normalize_Extra(DataTransformFn):
 
         # print("Normalize applied keys:", list(applied_dataset.keys()))
         # print("human actions: keys():", applied_dataset["human_action"].keys())
-        print("applied_dataset: human_action:", applied_dataset["human_action"]["data"].shape)
+        # print("applied_dataset: human_action:", applied_dataset["human_action"]["data"].shape)
         return applied_dataset
 
     

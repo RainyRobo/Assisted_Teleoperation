@@ -180,7 +180,7 @@ class AlohaInputs_Extra(transforms.DataTransformFn):
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
 
     def __call__(self, data: dict) -> dict:
-        # print("BBBBBBB:", data)
+        # print("BBBBBBB:", data.keys(), data['state'])
         data_ = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
 
         # ---- 状态 ----
@@ -325,6 +325,7 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
     # state is [left_arm_joint_angles, right_arm_joint_angles, left_arm_gripper, right_arm_gripper]
     # dim sizes: [6, 1, 6, 1]
     state = np.asarray(data["state"])
+    print(state.shape)
     state = _decode_state(state, adapt_to_pi=adapt_to_pi)
 
     def convert_image(img):

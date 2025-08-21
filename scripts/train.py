@@ -158,8 +158,6 @@ def train_step(
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
     
-<<<<<<< HEAD
-=======
     @at.typecheck
     def loss_fn_extra(
         model: _model.BaseModel, 
@@ -172,7 +170,6 @@ def train_step(
         # print("AAAAAAAAAAAAAAAAAA start")
         chunked_loss = model.compute_loss_extra(rng, observation, actions, human_action, his_state, train=True)
         return jnp.mean(chunked_loss)
->>>>>>> b27853e (conditional noise generation)
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions, human_action, his_state = batch

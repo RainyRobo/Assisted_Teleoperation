@@ -714,46 +714,19 @@ _CONFIGS = [
                 asset_id="trossen",
             ),
             default_prompt="uncap the pen",
-            # repack_transforms=_transforms.Group(
-            #     inputs=[
-            #         _transforms.RepackTransform(
-            #             {
-            #                 "images": {
-            #                     "cam_high": "observation.images.cam_high",
-            #                     "cam_low":
-            #                      "observation.images.cam_low",
-            #                     "cam_left_wrist": "observation.images.cam_left_wrist",
-            #                     "cam_right_wrist": "observation.images.cam_right_wrist",
-            #                 },
-            #                 "state": "observation.state",
-            #                 "actions": "action",
-            #                 "human_action": {
-            #                     "data": "human_action/data",
-            #                     "mask": "human_action/mask",
-            #                     "length": "human_action/length",
-            #                 },
-            #                 "his_state": {
-            #                     "data": "his_state/data",
-            #                     "mask": "his_state/mask",
-            #                     "length": "his_state/length",
-            #                     "curr_id": "his_state/curr_id",
-            #                 },
-            #             }
-            #         )
-            #     ]
-            # ),
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
                         {
                             "images": {
-                                "cam_high": "images/cam_high",
+                                "cam_high": "observation.images.cam_high",
                                 "cam_low":
-                                 "images/cam_low",
-                                "cam_left_wrist": "images/cam_left_wrist",
-                                "cam_right_wrist": "images/cam_right_wrist",
+                                 "observation.images.cam_low",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
                             },
-                            "state": "state",
+                            "state": "observation.state",
+                            "actions": "action",
                             "human_action": {
                                 "data": "human_action/data",
                                 "mask": "human_action/mask",
@@ -769,6 +742,33 @@ _CONFIGS = [
                     )
                 ]
             ),
+            # repack_transforms=_transforms.Group(
+            #     inputs=[
+            #         _transforms.RepackTransform(
+            #             {
+            #                 "images": {
+            #                     "cam_high": "images/cam_high",
+            #                     "cam_low":
+            #                      "images/cam_low",
+            #                     "cam_left_wrist": "images/cam_left_wrist",
+            #                     "cam_right_wrist": "images/cam_right_wrist",
+            #                 },
+            #                 "state": "state",
+            #                 "human_action": {
+            #                     "data": "human_action/data",
+            #                     "mask": "human_action/mask",
+            #                     "length": "human_action/length",
+            #                 },
+            #                 "his_state": {
+            #                     "data": "his_state/data",
+            #                     "mask": "his_state/mask",
+            #                     "length": "his_state/length",
+            #                     "curr_id": "his_state/curr_id",
+            #                 },
+            #             }
+            #         )
+            #     ]
+            # ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
