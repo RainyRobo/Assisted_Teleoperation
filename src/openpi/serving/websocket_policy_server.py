@@ -59,10 +59,7 @@ class WebsocketPolicyServer:
                 # print(args)
                 realtime = args.get("realtime", False)
                 guide = args.get("guide", False)
-<<<<<<< HEAD
-=======
                 human = True
->>>>>>> b27853e (conditional noise generation)
                 # print("AAAAAAAAA: args: ", args.keys())
                 infer_time = time.monotonic()
                 if realtime or guide:
@@ -77,17 +74,6 @@ class WebsocketPolicyServer:
                             prefix_attention_schedule=args.get("prefix_attention_schedule", None),
                             max_guidance_weight=args.get("max_guidance_weight", 1.0),
                         )
-<<<<<<< HEAD
-                    if guide:
-                        print("Guidance inference with observations:")
-                        action = self._policy.infer_guide(args.get("obs", {}),
-                            prev_action_chunk=args.get("prefix_actions"),
-                            inference_delay=args.get("inference_delay", 0),
-                            prefix_attention_horizon=args.get("prefix_attention_horizon", 0),
-                            prefix_attention_schedule=args.get("prefix_attention_schedule", None),
-                            max_guidance_weight=args.get("max_guidance_weight", 5.0),
-                        )
-=======
                     # if guide:
                     #     print("Guidance inference with observations:")
                     #     action = self._policy.infer_guide(args.get("obs", {}),
@@ -102,7 +88,6 @@ class WebsocketPolicyServer:
                                                       args.get("human_action", {}),
                                                       args.get("his_state", {}),
                     )
->>>>>>> b27853e (conditional noise generation)
                 else:
                     # If not realtime, we can just use the infer method.
                     print(args)

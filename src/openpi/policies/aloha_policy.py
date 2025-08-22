@@ -46,7 +46,7 @@ class AlohaInputs(transforms.DataTransformFn):
         data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
 
         # Get the state. We are padding from 14 to the model action dim.
-        state = transforms.pad_to_dim(data["state"], self.action_dim)
+        data["state"] = transforms.pad_to_dim(data["state"], self.action_dim)
 
         in_images = data["images"]
         if set(in_images) - set(self.EXPECTED_CAMERAS):
@@ -79,7 +79,7 @@ class AlohaInputs(transforms.DataTransformFn):
         inputs = {
             "image": images,
             "image_mask": image_masks,
-            "state": state,
+            "state": data["state"],
         }
 
         # Actions are only available during training.

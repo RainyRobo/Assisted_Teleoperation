@@ -299,7 +299,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         [
             *data_config.repack_transforms.inputs,
             _aloha_policy.AlohaInputs_Extra(),
-            _transforms.NoiseAdd(), 
+            # _transforms.NoiseAdd(), 
             data_config.data_transforms.inputs[-1],
             _transforms.Normalize_Extra(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,

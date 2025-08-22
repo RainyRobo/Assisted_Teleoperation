@@ -56,7 +56,7 @@ def create_trained_policy(
 
     logging.info("Loading model...")
     model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-
+    logging.info("using trained policy.")
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
@@ -81,7 +81,7 @@ def create_trained_policy(
         transforms=[
             *data_config.repack_transforms.inputs,
             _aloha_policy.AlohaInputs_Extra(),
-            transforms.NoiseAdd(), 
+            # transforms.NoiseAdd(), 
             data_config.data_transforms.inputs[-1],
             transforms.Normalize_Extra(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,

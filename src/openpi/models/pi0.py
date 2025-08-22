@@ -789,61 +789,51 @@ class Pi0(_model.BaseModel):
         observation = _model.preprocess_observation(None, observation, train=False)
         dt = -1.0 / num_steps  # 从 t=1 走到 0
         assert num_steps > 0
+        
+        batch_size = 1
 
         # ---- 取数据 ----
         human_action_data = human_action["data"]                    # [B, Th, D_in]
-        his_state_data    = his_state["data"]                       # [B, Ts, D_in]
-        human_mask        = human_action.get("mask", jnp.ones(human_action_data.shape[:2], bool))
-        his_mask          = his_state.get("mask",   jnp.ones(his_state_data.shape[:2], bool))
-        state_start       = int(human_action.get("curr_id", 0))     # 全局位置偏移（给 RoPE 用）
+        his_state_data    = his_state["data"]                      # [B, Ts, D_in]
+        human_mask        = human_action["mask"]                   # [B, jnp.ones(human_action_data.shape[:2], bool))
+        his_mask          = his_state["mask"]
+        state_start       = his_state["curr_id"]
 
         human_mask = human_mask.astype(bool)
         his_mask   = his_mask.astype(bool)
-
-        batch_size, Ts, D_in = his_state_data.shape
-        ah = self.action_horizon
-        assert Ts == ah, f"需要 Ts==ah 以对齐推理窗口，当前 Ts={Ts}, ah={ah}"
-
-        # ---- 编码 -> (B, T, E) ----
-        human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0,               deterministic=True)  # [B, Th, E]
-        his_state_emd   = self.state_enc(his_state_data,    his_mask,   pos_start=state_start,     deterministic=True)  # [B, Ts, E]
-
-        # ---- Cross-Attention: Q = his_state, KV = human_action ----
-        ctx, attn = self.cross_enc(
-            his_state_emd, human_state_emd,
-            kv_mask=human_mask, q_pos_start=state_start, kv_pos_start=0,
-            deterministic=True
-        )  # ctx: [B, Ts(=ah), E]
-
-        # ---- 通过 VAE 得到噪声分布 (优先)；否则回退到 gauss_heads ----
-        use_cvae = all(hasattr(self, name) for name in ["post_head", "decoder"])  # prior_head 可选
+        print(human_action_data.shape, his_state_data.shape, human_mask.shape, his_mask.shape)
+        # print(human_mask, his_mask)
+        jax.debug.print("human_action_mask = {x}", x=human_mask)
+        jax.debug.print("his_state_mask = {x}", x=his_mask)
+        jax.debug.print("human_action_data = {x}", x=human_action_data[0, 0, :])
+        jax.debug.print("his_state_data = {x}", x=his_state_data[0, 0, :])
+        
+        his_state_emd = self.state_enc(his_state_data, his_mask, pos_start=state_start, deterministic=True)  # [B, Ts, E]
+        # 走prior路径
+        cond = jnp.any(human_mask)
+        def infer_without_human(_):
+            mu_p, logvar_p = self.prior_head(his_state_emd)
+            eps = jax.random.normal(rng, mu_p.shape, dtype=mu_p.dtype)
+            z = mu_p + jnp.exp(0.5 * logvar_p) * eps
+            mu_noise, logvar_noise = self.decoder(his_state_emd, z)
+            return mu_noise, logvar_noise
+        def infer_with_human(_):
+            human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0, deterministic=True)  # [B, Th, E]
+            ctx, attn = self.cross_enc(his_state_emd, human_state_emd,
+                kv_mask=human_mask, q_mask = his_mask, q_pos_start=state_start, kv_pos_start=0,
+                deterministic=True
+            )  # ctx: [B, Ts(=ah), E]
+            mu_z, logvar_z = self.post_head(ctx)
+            jax.debug.print("mu_z, logvar_z = {x}", x=(mu_z[0, 0, :], logvar_z[0, 0, :]))
+            eps = jax.random.normal(rng, mu_z.shape, dtype=mu_z.dtype)
+            z = mu_z + jnp.exp(0.5 * logvar_z) * eps
+            mu_noise, logvar_noise = self.decoder(ctx, z)
+            return mu_noise, logvar_noise
+        
+        
+        mu_noise, logvar_noise = jax.lax.cond(cond, infer_with_human, infer_without_human, None)
+        jax.debug.print("mu_noise, logvar_noise = {x}", x=(mu_noise[0, 0, :], logvar_noise[0, 0, :]))
         rng, rng_z, rng_eps_noise = jax.random.split(rng, 3)
-
-        if use_cvae:
-            # q(z|ctx)
-            mu_z, logvar_z = self.post_head(ctx)              # [B, ah, Z]
-            # p(z|his_e) 或标准正态
-            if hasattr(self, "prior_head"):
-                mu_p, logvar_p = self.prior_head(his_state_emd)  # [B, ah, Z]
-            else:
-                mu_p  = jnp.zeros_like(mu_z)
-                logvar_p = jnp.zeros_like(logvar_z)
-
-            sample_from_prior = getattr(self, "sample_from_prior", False)
-            if sample_from_prior:
-                # z ~ p(z|his_e)
-                eps_z = jax.random.normal(rng_z, mu_p.shape, dtype=mu_p.dtype)
-                z = mu_p + jnp.exp(0.5 * logvar_p) * eps_z
-            else:
-                # z ~ q(z|ctx)
-                eps_z = jax.random.normal(rng_z, mu_z.shape, dtype=mu_z.dtype)
-                z = mu_z + jnp.exp(0.5 * logvar_z) * eps_z
-
-            # 解码得到噪声分布
-            mu_noise, logvar_noise = self.decoder(ctx, z)     # [B, ah, D_in], [B, ah, D_in]
-        else:
-            # 兼容旧逻辑：直接从 ctx 预测 (mu, logvar)
-            mu_noise, logvar_noise = self.gauss_heads(ctx)    # [B, ah, D_in], [B, ah, D_in]
 
         # ---- 采样噪声（元素级）作为 FM 初始分布 ----
         eps = jax.random.normal(rng_eps_noise, mu_noise.shape, dtype=mu_noise.dtype)  # [B, ah, D]
