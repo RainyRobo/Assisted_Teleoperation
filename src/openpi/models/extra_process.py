@@ -141,39 +141,28 @@ def kl_per_dim_diag_gauss(mu_q, logvar_q, mu_p, logvar_p):
     )
 
 def kl_balanced_with_freebits(
-    mu_z, logvar_z,   # posterior: [B,T,Z]
-    mu_p, logvar_p,   # prior:     [B,T,Z]
-    mask,             # [B,T] True=有效
-    alpha: float = 0.8,          # balancing 系数（0.5~0.8 常用）
-    free_bits: float = 0.5,      # 每维下限（单位：nat/维），0.25~1.0 常用
-    reduce: str = "mean",        # "mean" 或 "none"
+    mu_z, logvar_z, mu_p, logvar_p, mask,
+    alpha=0.8, free_bits=0.5, reduce="mean", eps=1e-8
 ):
-    # 两个方向的 KL（带 stop_gradient）
-    kl_q_p = kl_per_dim_diag_gauss(
-        mu_q=mu_z,            logvar_q=logvar_z,
-        mu_p=jax.lax.stop_gradient(mu_p),
-        logvar_p=jax.lax.stop_gradient(logvar_p)
-    )   # [B,T,Z]
+    # 1) 两个方向
+    kl_q_p = kl_per_dim_diag_gauss(mu_z, logvar_z, jax.lax.stop_gradient(mu_p), jax.lax.stop_gradient(logvar_p))
+    kl_p_q = kl_per_dim_diag_gauss(jax.lax.stop_gradient(mu_z), jax.lax.stop_gradient(logvar_z), mu_p, logvar_p)
+    kl_dim = alpha * kl_q_p + (1 - alpha) * kl_p_q                  # [B,T,Z]
 
-    kl_p_q = kl_per_dim_diag_gauss(
-        mu_q=jax.lax.stop_gradient(mu_z),
-        logvar_q=jax.lax.stop_gradient(logvar_z),
-        mu_p=mu_p,            logvar_p=logvar_p
-    )   # [B,T,Z]
+    # 2) 先对 (B,T) 做掩码均值，得到每维的平均 KL
+    m = mask.astype(kl_dim.dtype)[..., None]                         # [B,T,1]
+    kl_dim_mean = (kl_dim * m).sum(axis=(0,1)) / (m.sum(axis=(0,1)) + eps)  # [Z]
 
-    # balancing：逐维组合
-    kl_dim = alpha * kl_q_p + (1.0 - alpha) * kl_p_q            # [B,T,Z]
+    # 3) 逐维阈值（free-bits）
+    thr = jnp.maximum(kl_dim_mean - free_bits, 0.0)                  # [Z]
+    kl_dim_fb = jnp.maximum(kl_dim - thr[None, None, :], 0.0)        # [B,T,Z]
 
-    # free-bits：逐维裁下限（nat/维）
-    kl_dim_fb = jnp.maximum(kl_dim - free_bits, 0.0)            # [B,T,Z]
-
-    # 按维求和得到每步 KL，再做掩码平均
-    kl_step = kl_dim_fb.sum(axis=-1)                             # [B,T]
+    # 4) 汇总
+    kl_step = kl_dim_fb.sum(-1)                                      # [B,T]
     if reduce == "none":
-        return kl_step  # 你若还想像以前一样保留 [B,T] 逐步 KL 就返回它
+        return kl_step
+    return (kl_step * mask.astype(kl_step.dtype)).sum() / (mask.sum() + eps)
 
-    kl_loss = masked_mean(kl_step, mask)                         # 标量
-    return kl_loss
 
 # -------------------------
 # TCC（cycle-back regression）
@@ -455,80 +444,35 @@ class GaussianDecoderMLP(nnx.Module):
         logvar = jnp.clip(self.lv_head(h), -10.0, 5.0)
         return mu, logvar
 
-class GaussianDecoderResMLP(nnx.Module):
-    def __init__(self, ctx_dim: int, z_dim: int, out_dim: int,
-                 hidden: int | None = None, n_blocks: int = 2, dropout: float = 0.0, rngs=None):
+class GaussianDecoderResidual(nnx.Module):
+    def __init__(self, ctx_dim, z_dim, out_dim, hidden=None, rngs=None):
         super().__init__()
-        in_dim = ctx_dim + z_dim
-        h = hidden or max(in_dim, 2*out_dim)
-        self.inp = nnx.Linear(in_dim, h, rngs=rngs)
-        self.blocks = []
-        for _ in range(n_blocks):
-            self.blocks.append((
-                nnx.LayerNorm(h, rngs=rngs),
-                nnx.Linear(h, h, rngs=rngs),
-                nnx.Linear(h, h, rngs=rngs),
-                nnx.Dropout(dropout, rngs=rngs),
-            ))
-        self.out_mu = nnx.Linear(h, out_dim, rngs=rngs)
-        self.out_lv = nnx.Linear(h, out_dim, rngs=rngs)
-        self.dropout = nnx.Dropout(dropout, rngs=rngs)
+        h = hidden or max(ctx_dim + z_dim, 2*out_dim)
+        # ctx 基线
+        self.ctx_fc1 = nnx.Linear(ctx_dim, h, rngs=rngs)
+        self.ctx_fc2 = nnx.Linear(h, h, rngs=rngs)
+        self.mu_ctx  = nnx.Linear(h, out_dim, rngs=rngs)
+        self.lv_ctx  = nnx.Linear(h, out_dim, rngs=rngs)
+        # z 残差
+        self.z_fc1   = nnx.Linear(z_dim, h, rngs=rngs)
+        self.z_fc2   = nnx.Linear(h, h, rngs=rngs)
+        self.mu_res  = nnx.Linear(h, out_dim, rngs=rngs)
+        self.lv_res  = nnx.Linear(h, out_dim, rngs=rngs)
+        self.film = nnx.Linear(z_dim, 2*h, rngs=rngs)
 
-    def __call__(self, ctx, z, *, mask=None, deterministic=True):
-        x = jnp.concatenate([ctx, z], axis=-1)
-        h = jax.nn.gelu(self.inp(x))
-        for ln, fc1, fc2, do in self.blocks:
-            r = h
-            h = ln(h)
-            h = jax.nn.gelu(fc1(h))
-            h = do(jax.nn.gelu(fc2(h)), deterministic=deterministic)
-            h = r + h
-        mu = self.out_mu(h)
-        logvar = jnp.clip(self.out_lv(h), -10.0, 5.0)
-        return mu, logvar
+    def __call__(self, ctx, z):
+        # ctx path
+        hc = jax.nn.gelu(self.ctx_fc1(ctx))
+        hc = jax.nn.gelu(self.ctx_fc2(hc))
+        # z path
+        hz = jax.nn.gelu(self.z_fc1(z))
+        hz = jax.nn.gelu(self.z_fc2(hz))
+        scale, shift = jnp.split(self.film(z), 2, axis=-1)
+        hc_mod = hc * (1 + scale) + shift
 
-class GaussianDecoderFiLM(nnx.Module):
-    def __init__(self, ctx_dim: int, z_dim: int, out_dim: int,
-                 hidden: int | None = None, rngs=None):
-        super().__init__()
-        h = hidden or max(ctx_dim, 2*out_dim)
-        self.ctx_mlp1 = nnx.Linear(ctx_dim, h, rngs=rngs)
-        self.ctx_mlp2 = nnx.Linear(h, h, rngs=rngs)
-        self.z_proj   = nnx.Linear(z_dim, h*2, rngs=rngs)  # -> gamma, beta
-        self.out_mu = nnx.Linear(h, out_dim, rngs=rngs)
-        self.out_lv = nnx.Linear(h, out_dim, rngs=rngs)
-
-    def __call__(self, ctx, z, *, mask=None, deterministic=True):
-        h = jax.nn.gelu(self.ctx_mlp1(ctx))      # 只由 ctx 产生基底
-        h = jax.nn.gelu(self.ctx_mlp2(h))
-        gb = self.z_proj(z)                      # z 产生 γ,β
-        gamma, beta = jnp.split(gb, 2, axis=-1)
-        h = gamma * h + beta                     # FiLM 调制
-        mu = self.out_mu(h)
-        logvar = jnp.clip(self.out_lv(h), -10.0, 5.0)
-        return mu, logvar
-
-class GaussianDecoderGRU(nnx.Module):
-    def __init__(self, ctx_dim: int, z_dim: int, out_dim: int,
-                 hidden: int | None = None, rngs=None):
-        super().__init__()
-        in_dim = ctx_dim + z_dim
-        h = hidden or max(in_dim, 2*out_dim)
-        self.inp = nnx.Linear(in_dim, h, rngs=rngs)
-        self.gru = nnx.GRUCell(h, rngs=rngs)           # 假设 nnx.GRUCell 可用
-        self.out_mu = nnx.Linear(h, out_dim, rngs=rngs)
-        self.out_lv = nnx.Linear(h, out_dim, rngs=rngs)
-
-    def __call__(self, ctx, z, *, mask=None, deterministic=True):
-        x = jnp.concatenate([ctx, z], axis=-1)  # [B,T,E+Z]
-        B, T, _ = x.shape
-        h = jax.nn.gelu(self.inp(x))
-        state = jnp.zeros((B, self.gru.hidden_size), dtype=h.dtype)
-        mus, lvs = [], []
-        for t in range(T):
-            state, _ = self.gru(h[:, t], state)
-            mus.append(self.out_mu(state))
-            lvs.append(self.out_lv(state))
-        mu = jnp.stack(mus, axis=1)
-        logvar = jnp.clip(jnp.stack(lvs, axis=1), -10.0, 5.0)
+        mu_base     = self.mu_ctx(hc_mod)
+        logvar_base = self.lv_ctx(hc_mod)
+        mu          = mu_base + self.mu_res(hz)
+        logvar      = logvar_base + self.lv_res(hz)
+        logvar = jnp.clip(logvar, -10.0, 5.0)  # 或 softplus 参数化
         return mu, logvar
