@@ -183,9 +183,6 @@ class AlohaInputs_Extra(transforms.DataTransformFn):
         # print("BBBBBBB:", data.keys(), data['state'])
         data_ = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
 
-        # ---- 状态 ----
-        # 先做 decode，再做 pad（pad_to_dim 允许 (D,) 或 (T,D) 都可）
-        state = _decode_state(data_["state"], adapt_to_pi=self.adapt_to_pi)
         state = transforms.pad_to_dim(state, self.action_dim)
         # print(state.shape)
 
@@ -234,7 +231,9 @@ class AlohaInputs_Extra(transforms.DataTransformFn):
 
         if "prompt" in data_:
             inputs["prompt"] = data_["prompt"]
-
+        
+        
+        # TODO
         if "his_state" in data_ and "data" in data_["his_state"]:
             hs = _decode_state(np.asarray(data_["his_state"]["data"]), adapt_to_pi=self.adapt_to_pi)
             hs = transforms.pad_to_dim(hs, self.action_dim)

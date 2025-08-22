@@ -210,6 +210,7 @@ class Normalize_Extra(DataTransformFn):
             ns = {k: v for k, v in ns.items() if k in data}
 
         # 应用归一化（应只改有 stats 的叶子，其他键保持原样）
+        # TODO
         applied_dataset = apply_tree(
             data,
             ns,
@@ -259,6 +260,7 @@ class Normalize_Extra(DataTransformFn):
 #         data["human_action"]["data"] = human_action
 #         return data
 
+# TODO 给人的演示轨迹加噪声
 @dataclasses.dataclass(frozen=True)
 class NoiseAdd:
     noise_std: float = 1.0
@@ -276,9 +278,9 @@ class NoiseAdd:
             raise ValueError(f"[NoiseAdd] Expected shape (T,D), got {x.shape}")
 
         T, D = x.shape
-        if self.print_once and not hasattr(self, "_printed"):
-            print(f"[NoiseAdd] human_action shape: (T={T}, D={D})")
-            object.__setattr__(self, "_printed", True)
+        # if self.print_once and not hasattr(self, "_printed"):
+        #     print(f"[NoiseAdd] human_action shape: (T={T}, D={D})")
+        #     object.__setattr__(self, "_printed", True)
 
         # ---- 局部替换噪声 ----
         local_noise = np.random.normal(0.0, self.noise_std, size=x.shape).astype(x.dtype, copy=False)

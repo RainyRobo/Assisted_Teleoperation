@@ -240,6 +240,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
 
+    #
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
@@ -708,12 +709,13 @@ _CONFIGS = [
         name="pi0_piper_pen_uncap_low_mem_finetune",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAlohaDataConfig(
-            repo_id="RainyBot/teleoperation_uncap_pen",
+            repo_id="RainyBot/Piper_Uncap_Pen",
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
                 asset_id="trossen",
             ),
             default_prompt="uncap the pen",
+            # TODO  name mapping
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(

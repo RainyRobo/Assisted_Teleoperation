@@ -67,6 +67,7 @@ def create_trained_policy(
 
     return _policy.Policy(
         model,
+        
         # transforms=[
         #     *repack_transforms.inputs,
         #     transforms.InjectDefaultPrompt(default_prompt),
@@ -74,6 +75,9 @@ def create_trained_policy(
         #     transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
         #     *data_config.model_transforms.inputs,
         # ],
+        
+        # 输入数据的变换
+        # TODO 测试输出
         transforms=[
             *data_config.repack_transforms.inputs,
             _aloha_policy.AlohaInputs_Extra(),
@@ -82,6 +86,7 @@ def create_trained_policy(
             transforms.Normalize_Extra(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
+        # 输出 没有改动
         output_transforms=[
             *data_config.model_transforms.outputs,
             transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
