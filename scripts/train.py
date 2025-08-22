@@ -69,6 +69,17 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
+def linear_warmup(step: jnp.ndarray, warmup_steps: int, max_value: float) -> jnp.ndarray:
+    if warmup_steps <= 0:
+        return jnp.array(max_value, dtype=jnp.float32)
+    r = jnp.clip(step / float(warmup_steps), 0.0, 1.0)
+    return jnp.array(max_value, dtype=jnp.float32) * r
+
+def cosine_warmup(step: jnp.ndarray, warmup_steps: int, max_value: float) -> jnp.ndarray:
+    if warmup_steps <= 0:
+        return jnp.array(max_value, dtype=jnp.float32)
+    r = jnp.clip(step / float(warmup_steps), 0.0, 1.0)
+    return jnp.array(max_value, dtype=jnp.float32) * 0.5 * (1.0 - jnp.cos(jnp.pi * r))
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
@@ -143,6 +154,16 @@ def train_step(
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
+    
+    step_scalar = jnp.array(state.step, dtype=jnp.float32)
+    beta_kl = cosine_warmup(step_scalar, 5_000, 1e-2)
+    w_tcc_raw   = cosine_warmup(step_scalar - 2_000,  5_000, 1e-5)
+    w_tcc = jnp.clip(w_tcc_raw, 0., None)
+    
+    # model.kl_weight      = float(beta_kl)
+    # model.tcc_weight     = float(w_tcc)
+    # jax.debug.print("beta_kl={:.6f}, w_tcc={:.6f}", beta_kl, w_tcc)
+
 
     @at.typecheck
     def loss_fn(
@@ -167,9 +188,8 @@ def train_step(
         human_action: dict,
         his_state: dict,
     ):
-        # print("AAAAAAAAAAAAAAAAAA start")
-        chunked_loss = model.compute_loss_extra(rng, observation, actions, human_action, his_state, train=True)
-        return jnp.mean(chunked_loss)
+        loss_dict = model.compute_loss_extra(rng, observation, actions, human_action, his_state, train=True, kl_weight=beta_kl, tcc_weight=w_tcc)
+        return jnp.mean(loss_dict["total"]), loss_dict
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions, human_action, his_state = batch
@@ -177,7 +197,7 @@ def train_step(
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
     # loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
-    loss, grads = nnx.value_and_grad(loss_fn_extra, argnums=diff_state)(model, train_rng, observation, actions, human_action, his_state)
+    (loss, loss_dict), grads = nnx.value_and_grad(loss_fn_extra, argnums=diff_state, has_aux=True)(model, train_rng, observation, actions, human_action, his_state)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -207,25 +227,14 @@ def train_step(
     )
     info = {
         "loss": loss,
+        "kl_loss": jnp.mean(loss_dict["kl"]),
+        "tcc_loss": loss_dict["tcc"],
+        "kl_weight": loss_dict["kl_weight"],
+        "tcc_weight": loss_dict["tcc_weight"],
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
     return new_state, info
-
-def eval_step(
-    config: _config.TrainConfig,
-    state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
-) -> dict[str, at.Array]:
-    eval_params = state.ema_params if state.ema_params is not None else state.params
-    model = nnx.merge(state.model_def, eval_params)
-    model.eval()
-
-    observation, actions = batch
-    # loss = model.compute_loss(None, observation, actions)  # 如果内部会按 eval 路径
-    val_chunked = model.compute_HumAction_loss(None, observation, actions, train=False)
-    return {"val_loss": jnp.mean(val_chunked)}
-
 
 def main(config: _config.TrainConfig):
     init_logging()
@@ -263,10 +272,6 @@ def main(config: _config.TrainConfig):
     # 数据迭代器：
     data_iter = iter(data_loader)
     batch = next(data_iter)
-    # # _obs, _action, _human, _state = batch
-    # logging.info(f"Current batch contains: {_human}")
-    # logging.info(f"state: {_state}")
-    # logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
     images_to_log = [

@@ -203,7 +203,7 @@ class Normalize_Extra(DataTransformFn):
                 ns["his_state"] = {"data": ns["state"]}
         if isinstance(data.get("human_action"), dict) and "data" in data["human_action"]:
             if "actions" in ns:
-                ns["human_action"] = {"data": ns["actions"]}
+                ns["human_action"] = {"data": ns["state"]}
 
         # 严格模式下：只保留顶层在 data 里出现过的键（避免 apply_tree 因多余键报错）
         if self.strict:
@@ -237,6 +237,68 @@ class Normalize_Extra(DataTransformFn):
         assert stats.q01 is not None
         assert stats.q99 is not None
         return (x - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
+
+# @dataclasses.dataclass(frozen=True)
+# class NoiseAdd(DataTransformFn):
+#     noise_std: float = 1.0
+#     mask_ratio: float = 0.1  # 比例，例如 10% 的值会被 mask
+
+#     def __call__(self, data: DataDict) -> DataDict:
+#         print("noise add")
+#         human_action = data["human_action"]["data"]
+#         shape = human_action.shape
+
+#         # 随机生成 mask，True 表示被 mask
+#         mask = np.random.rand(*shape) < self.mask_ratio  
+
+#         # 生成噪声
+#         noise = np.random.normal(0, self.noise_std, shape)
+
+#         # 应用：mask 位置替换成噪声，其它位置保持原值
+#         human_action = np.where(mask, noise, human_action)
+#         data["human_action"]["data"] = human_action
+#         return data
+
+@dataclasses.dataclass(frozen=True)
+class NoiseAdd:
+    noise_std: float = 1.0
+    mask_ratio: float = 0.1
+    global_std: float = 0.05
+    per_seq_std: bool = True
+    std_range: tuple[float, float] = (0.5, 1.5)  # 噪声强度缩放范围
+    print_once: bool = False     # 是否仅首次打印形状
+
+    def __call__(self, data: DataDict) -> DataDict:
+        ha = data.get("human_action", None)
+
+        x = np.asarray(ha["data"])  # (T, D)
+        if x.ndim != 2:
+            raise ValueError(f"[NoiseAdd] Expected shape (T,D), got {x.shape}")
+
+        T, D = x.shape
+        if self.print_once and not hasattr(self, "_printed"):
+            print(f"[NoiseAdd] human_action shape: (T={T}, D={D})")
+            object.__setattr__(self, "_printed", True)
+
+        # ---- 局部替换噪声 ----
+        local_noise = np.random.normal(0.0, self.noise_std, size=x.shape).astype(x.dtype, copy=False)
+        replace_mask = np.random.rand(*x.shape) < self.mask_ratio
+        x_noisy = np.where(replace_mask, local_noise, x)
+
+        # ---- 全局加性噪声 ----
+        if self.per_seq_std:
+            scale = np.random.uniform(self.std_range[0], self.std_range[1])
+        else:
+            scale = 1.0
+        global_noise = np.random.normal(0.0, self.global_std, size=x.shape).astype(x.dtype) * scale
+        x_noisy = x_noisy + global_noise
+
+        # ---- 写回 ----
+        data = dict(data)
+        data["human_action"] = dict(ha)
+        data["human_action"]["data"] = x_noisy
+        return data
+
 
 
 @dataclasses.dataclass(frozen=True)

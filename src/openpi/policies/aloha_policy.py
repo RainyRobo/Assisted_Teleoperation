@@ -187,7 +187,7 @@ class AlohaInputs_Extra(transforms.DataTransformFn):
         # 先做 decode，再做 pad（pad_to_dim 允许 (D,) 或 (T,D) 都可）
         state = _decode_state(data_["state"], adapt_to_pi=self.adapt_to_pi)
         state = transforms.pad_to_dim(state, self.action_dim)
-        print(state.shape)
+        # print(state.shape)
 
         # ---- 图像 ----
         in_images = data_["images"]
@@ -237,7 +237,6 @@ class AlohaInputs_Extra(transforms.DataTransformFn):
 
         if "his_state" in data_ and "data" in data_["his_state"]:
             hs = _decode_state(np.asarray(data_["his_state"]["data"]), adapt_to_pi=self.adapt_to_pi)
-            # 若下游需要与 state 同维对齐，请保留这一行；否则可删掉
             hs = transforms.pad_to_dim(hs, self.action_dim)
             inputs["his_state"] = {**data_["his_state"], "data": hs}
         else:
@@ -248,7 +247,6 @@ class AlohaInputs_Extra(transforms.DataTransformFn):
             # 若下游把 human_action 当作目标或与 actions 对齐计算，请保留这一行；否则可删掉
             ha = transforms.pad_to_dim(ha, self.action_dim)
             inputs["human_action"] = {**data_["human_action"], "data": ha}
-            print(inputs["human_action"]["data"].shape)
         else:
             inputs["human_action"] = data_.get("human_action", None)
 
@@ -325,7 +323,7 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
     # state is [left_arm_joint_angles, right_arm_joint_angles, left_arm_gripper, right_arm_gripper]
     # dim sizes: [6, 1, 6, 1]
     state = np.asarray(data["state"])
-    print(state.shape)
+    # print(state.shape)
     state = _decode_state(state, adapt_to_pi=adapt_to_pi)
 
     def convert_image(img):

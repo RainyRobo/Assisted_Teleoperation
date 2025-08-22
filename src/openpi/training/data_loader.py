@@ -293,13 +293,13 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     # print(f"dataset shape: {dataset[0]['his_state']['data'].shape}")
     # print(f"dataset shape: {dataset[0]['observation.state'].shape}")
     # raise ValueError(f"dataset keys: {dataset[0].keys()}")
-    # print(*data_config.data_transforms.inputs)
+    # print(data_config.data_transforms.inputs[-1])
     trans_dataset =  TransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
-            # *data_config.data_transforms.inputs,
             _aloha_policy.AlohaInputs_Extra(),
+            _transforms.NoiseAdd(), 
             data_config.data_transforms.inputs[-1],
             _transforms.Normalize_Extra(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,

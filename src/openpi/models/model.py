@@ -279,6 +279,8 @@ class BaseModel(nnx.Module, abc.ABC):
         human_action,
         his_state,
         *,
+        kl_weight: float,
+        tcc_weight: float,
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]: ...
 

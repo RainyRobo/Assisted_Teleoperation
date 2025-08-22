@@ -76,12 +76,11 @@ def create_trained_policy(
         # ],
         transforms=[
             *data_config.repack_transforms.inputs,
-            # *data_config.data_transforms.inputs,
             _aloha_policy.AlohaInputs_Extra(),
+            transforms.NoiseAdd(), 
             data_config.data_transforms.inputs[-1],
             transforms.Normalize_Extra(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
-            
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
