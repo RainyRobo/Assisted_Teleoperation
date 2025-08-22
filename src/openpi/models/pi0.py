@@ -273,11 +273,12 @@ class Pi0(_model.BaseModel):
         # VAE heads
         self.post_head  = _extra_process.GaussianHead(self.vae_hidden_dim, config.latent_dim, rngs=rngs)  # q(z|ctx)
         self.prior_head = _extra_process.GaussianHead(self.vae_hidden_dim, config.latent_dim, rngs=rngs)  # p(z|his_e)
-        self.decoder    = _extra_process.GaussianDecoderMLP(ctx_dim=self.vae_hidden_dim,
-                                             z_dim=config.latent_dim,
-                                             out_dim=config.action_dim,
-                                             rngs=rngs)
-
+        # self.decoder    = _extra_process.GaussianDecoderMLP(ctx_dim=self.vae_hidden_dim,
+        #                                      z_dim=config.latent_dim,
+        #                                      out_dim=config.action_dim,
+        #                                      rngs=rngs)
+        self.decoder = _extra_process.GaussianDecoderResidual(self.vae_hidden_dim, config.latent_dim, config.action_dim, rngs=rngs)
+        self.drop_human = 0.2
         # loss weights（从 config 读取或给默认）
         # self.kl_weight      = getattr(config, "kl_weight", 1e-4)
         # self.tcc_weight     = getattr(config, "tcc_weight", 1e-2)
@@ -430,6 +431,9 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b ah"]:
 
         observation = _model.preprocess_observation(None, observation, train=False)
+        rng, eps_z_rng, eps_pad_rng, time_rng, eps_noise_rng, eps_noise_pad_rng, drop_rng = jax.random.split(rng, 7)
+
+        drop_flag = (jax.random.uniform(drop_rng, ()) < self.drop_rate)
 
         # ---- 数据 & mask ----
         human_action_data = human_action["data"]                    # [B, Th, D]
@@ -444,8 +448,9 @@ class Pi0(_model.BaseModel):
 
         human_mask = human_mask.astype(bool)
         his_mask   = his_mask.astype(bool)
-        # jax.debug.print("his_mask = {x}", x=his_mask)
-        # jax.debug.print("human_mask = {x}", x=human_mask)
+        has_human_batch = jnp.any(human_mask)
+        # 训练时有一定概率丢弃 human
+        use_human = jnp.logical_and(has_human_batch, jnp.logical_not(drop_flag))
 
         # ---- 编码到 E ----
         human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0, deterministic=not train)  # [B, Th, E]
@@ -454,10 +459,17 @@ class Pi0(_model.BaseModel):
 
         q_pos_idx = curr_id - his_window_size + 1
         q_pos_start = jnp.clip(q_pos_idx, 0, 1000)
-        # jax.debug.print("q_pos_start = {x}", x=q_pos_start)
+        # jax.debug.print("q_pos_start = {x}", x=q_pos_start.shape)
         # ---- Cross-Attention：Q=his_e, KV=human_e ----
-        ctx, attn = self.cross_enc(his_state_emd, human_state_emd, kv_mask=human_mask, q_mask=his_mask,
-                                   q_pos_start=q_pos_start, kv_pos_start=0, deterministic=not train)                    # ctx:[B, Ts, E]
+        def build_ctx_with_human():
+            ctx, attn = self.cross_enc(his_state_emd, human_state_emd, kv_mask=human_mask, q_mask=his_mask,
+                                    q_pos_start=q_pos_start, kv_pos_start=0, deterministic=not train)                 # ctx:[B, Ts, E]
+            return ctx, attn
+        
+        def build_ctx_without_human():
+            return his_state_emd, None
+        
+        ctx, attn = jax.lax.cond(use_human, build_ctx_with_human, build_ctx_without_human, operand=None)
 
         # 对齐 action_horizon
         ah = actions.shape[1]
@@ -465,17 +477,27 @@ class Pi0(_model.BaseModel):
         assert Ts == ah, f"CrossEncoder 输出长度 Ts={Ts} 必须与 action_horizon ah={ah} 对齐。"
 
         # ---- VAE: q(z|ctx), p(z|his_e) ----
-        mu_z, logvar_z = self.post_head(ctx)        # [B, ah, Z]
+        # mu_z, logvar_z = self.post_head(ctx)        # [B, ah, Z]
         mu_p, logvar_p = self.prior_head(his_state_emd)  # [B, ah, Z]  # his_e 与 ctx 等长（Ts==ah）
+        def post_head_on(_):  return self.post_head(ctx)
+        def post_head_off(_): return (jnp.zeros_like(mu_p), jnp.zeros_like(logvar_p))
+        mu_z, logvar_z = jax.lax.cond(use_human, post_head_on, post_head_off, operand=None)  # [B, ah, Z]
+        
+        beta_small = (kl_weight <= 1e-5)
+        use_prior_z = jnp.logical_or(beta_small,jnp.logical_not(use_human))
+        
+        def sample_prior(_):
+            eps = jax.random.normal(eps_z_rng, mu_p.shape, dtype=mu_p.dtype)
+            return mu_p + jnp.exp(0.5 * logvar_p) * eps
 
-        rng, eps_z_rng, time_rng, eps_noise_rng = jax.random.split(rng, 4)
-        # 采样 z
-        eps_z = jax.random.normal(eps_z_rng, mu_z.shape, dtype=mu_z.dtype)
-        z = mu_z + jnp.exp(0.5 * logvar_z) * eps_z
+        def sample_posterior(_):
+            eps = jax.random.normal(eps_z_rng, mu_z.shape, dtype=mu_z.dtype)
+            return mu_z + jnp.exp(0.5 * logvar_z) * eps
 
-        # 对应 mask=0 的位置，用独立噪声代替
+        z = jax.lax.cond(use_prior_z, sample_prior, sample_posterior, operand=None)  # [B, ah, Z]
+
         mask_f = his_mask.astype(mu_z.dtype)[..., None]  # [B,ah,1]
-        z = mask_f * z + (1 - mask_f) * jax.random.normal(eps_z_rng, z.shape, dtype=z.dtype)
+        z = mask_f * z + (1 - mask_f) * jax.random.normal(eps_pad_rng, z.shape, dtype=z.dtype)
 
         # ---- Decoder: (μ_noise, logσ²_noise) ----
         mu_noise, logvar_noise = self.decoder(ctx, z)    # [B, ah, D]
@@ -484,7 +506,7 @@ class Pi0(_model.BaseModel):
         eps   = jax.random.normal(eps_noise_rng, mu_noise.shape, dtype=mu_noise.dtype)
         std   = jnp.exp(0.5 * logvar_noise)
         noise = mu_noise + std * eps                     # [B, ah, D]
-        noise = mask_f * noise + (1 - mask_f) * jax.random.normal(eps_noise_rng, noise.shape, dtype=noise.dtype)
+        noise = mask_f * noise + (1 - mask_f) * jax.random.normal(eps_noise_pad_rng, noise.shape, dtype=noise.dtype)
 
         # ---- 采样时间 & 构造 x_t / 目标 u_t（FM）----
         B = actions.shape[0]
@@ -497,8 +519,6 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)               # [B,P,*]
         suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)    # [B,ah+1,*]
 
-        # input_mask = jnp.concatenate([prefix_mask, prefix_mask*0 + 1], axis=1) if suffix_mask is None \
-        #              else jnp.concatenate([prefix_mask, suffix_mask], axis=1)                      # [B,P+S]
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask    = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)                    # [B,P+S]
         attn_mask_llm  = make_attn_mask(input_mask, ar_mask)
@@ -514,30 +534,27 @@ class Pi0(_model.BaseModel):
         # ---- per-step MSE（FM）----
         mse_step = jnp.mean((v_t - u_t) ** 2, axis=-1)                                            # [B, ah]
 
-        # ---- KL on z（逐维求和 → [B, ah]）----
-        # kl_step = 0.5 * (
-        #     (jnp.exp(logvar_z) + jnp.square(mu_z - mu_p)) / jnp.exp(logvar_p)
-        #     - 1.0 + (logvar_p - logvar_z)
-        # ).sum(-1)  # [B,ah]
-        # kl_step = kl_step * his_mask                                                                               # [B, ah]
-        kl_step = _extra_process.kl_balanced_with_freebits(
-            mu_z, logvar_z, mu_p, logvar_p,
-            mask=his_mask, alpha=0.8, free_bits=0.5, reduce="mean"
-        )
-        
-        # ---- TCC（his_e vs human_e） & Attention 平滑 ----
-        tcc = _extra_process.tcc_cycle_back_regression(his_state_emd, human_state_emd, mask_u=his_mask, mask_v=human_mask,
-                                        tau=getattr(self, "tcc_tau", 0.1),
-                                        lambda_logvar=getattr(self, "tcc_lambda_logvar", 1e-3))  # 标量
-        # tv_reg  = attn_tv_l1(attn, human_mask)                                                   # 标量
-        # lap_reg = attn_laplace_l2(attn, human_mask)                                              # 标量
+        def _with_human_step(_):
+            kl_step = _extra_process.kl_balanced_with_freebits(
+                mu_z, logvar_z, mu_p, logvar_p,
+                mask=his_mask, alpha=0.8, free_bits=0.5, reduce="none"  # [B, ah]
+            )
+            tcc_val = _extra_process.tcc_cycle_back_regression(
+                his_state_emd, human_state_emd, mask_u=his_mask, mask_v=human_mask,
+                tau=getattr(self, "tcc_tau", 0.1),
+                lambda_logvar=getattr(self, "tcc_lambda_logvar", 1e-3)   # 标量
+            )
+            tcc_step = jnp.full_like(mse_step, tcc_val)  # 广播到 [B, ah]
+            return kl_step, tcc_step
 
-        # ---- 合成 per-step loss（广播正则）----
-        loss_step = mse_step + kl_weight * kl_step                                          # [B, ah]
-        loss_step = loss_step + tcc_weight * tcc # self.tv_weight * tv_reg + self.laplace_weight * lap_reg
+        def _without_human_step(_):
+            zeros = jnp.zeros_like(mse_step)  # [B, ah]
+            return zeros, zeros
 
-        # return loss_step  # [B, ah]
-        return {"total": loss_step, "kl": kl_step, "tcc": tcc, "kl_weight": kl_weight, "tcc_weight": tcc_weight}  # [B, ah]
+        kl_step, tcc_step = jax.lax.cond(use_human, _with_human_step, _without_human_step, operand=None)
+
+        loss_step = mse_step + kl_weight * kl_step + tcc_weight * tcc_step
+        return {"total": loss_step, "kl": kl_step, "tcc": tcc_step, "kl_weight": kl_weight, "tcc_weight": tcc_weight}  # [B, ah]
 
     @override
     def sample_actions(
