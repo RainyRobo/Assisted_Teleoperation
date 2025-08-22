@@ -278,7 +278,7 @@ class Pi0(_model.BaseModel):
         #                                      out_dim=config.action_dim,
         #                                      rngs=rngs)
         self.decoder = _extra_process.GaussianDecoderResidual(self.vae_hidden_dim, config.latent_dim, config.action_dim, rngs=rngs)
-        self.drop_human = 0.2
+        self.drop_rate = 0.2
         # loss weights（从 config 读取或给默认）
         # self.kl_weight      = getattr(config, "kl_weight", 1e-4)
         # self.tcc_weight     = getattr(config, "tcc_weight", 1e-2)
@@ -461,13 +461,14 @@ class Pi0(_model.BaseModel):
         q_pos_start = jnp.clip(q_pos_idx, 0, 1000)
         # jax.debug.print("q_pos_start = {x}", x=q_pos_start.shape)
         # ---- Cross-Attention：Q=his_e, KV=human_e ----
-        def build_ctx_with_human():
+        def build_ctx_with_human(_):
             ctx, attn = self.cross_enc(his_state_emd, human_state_emd, kv_mask=human_mask, q_mask=his_mask,
                                     q_pos_start=q_pos_start, kv_pos_start=0, deterministic=not train)                 # ctx:[B, Ts, E]
             return ctx, attn
         
-        def build_ctx_without_human():
-            return his_state_emd, None
+        def build_ctx_without_human(_):
+            dummy_attn = jnp.zeros((his_state_emd.shape[0], 4, his_state_emd.shape[1], human_state_emd.shape[1]))  
+            return his_state_emd, dummy_attn
         
         ctx, attn = jax.lax.cond(use_human, build_ctx_with_human, build_ctx_without_human, operand=None)
 

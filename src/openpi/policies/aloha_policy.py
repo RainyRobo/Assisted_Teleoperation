@@ -183,7 +183,7 @@ class AlohaInputs_Extra(transforms.DataTransformFn):
         # print("BBBBBBB:", data.keys(), data['state'])
         data_ = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
 
-        state = transforms.pad_to_dim(state, self.action_dim)
+        data['state'] = transforms.pad_to_dim(data['state'], self.action_dim)
         # print(state.shape)
 
         # ---- 图像 ----
@@ -222,7 +222,7 @@ class AlohaInputs_Extra(transforms.DataTransformFn):
         inputs = {
             "image": images,
             "image_mask": image_masks,
-            "state": state,
+            "state": data['state'],
         }
 
         if "actions" in data_:
