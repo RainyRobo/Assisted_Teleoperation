@@ -262,28 +262,17 @@ class Pi0(_model.BaseModel):
         self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
         
-        self.vae_hidden_dim = 256
+        self.vae_hidden_dim = 128
         
-                # encoders
+        # encoders
         self.state_enc = _extra_process.StateEncoder(config.action_dim, self.vae_hidden_dim,
-                                      num_heads=4, n_layers=3, rngs=rngs)
+                                      num_heads=4, n_layers=2, rngs=rngs)
         self.cross_enc = _extra_process.CrossEncoder(self.vae_hidden_dim,
                                       num_heads=4, use_rope=True, rngs=rngs)
 
-        # VAE heads
-        self.post_head  = _extra_process.GaussianHead(self.vae_hidden_dim, config.latent_dim, rngs=rngs)  # q(z|ctx)
-        self.prior_head = _extra_process.GaussianHead(self.vae_hidden_dim, config.latent_dim, rngs=rngs)  # p(z|his_e)
-        # self.decoder    = _extra_process.GaussianDecoderMLP(ctx_dim=self.vae_hidden_dim,
-        #                                      z_dim=config.latent_dim,
-        #                                      out_dim=config.action_dim,
-        #                                      rngs=rngs)
-        self.decoder = _extra_process.GaussianDecoderResidual(self.vae_hidden_dim, config.latent_dim, config.action_dim, rngs=rngs)
-        self.drop_rate = 0.2
-        # loss weights（从 config 读取或给默认）
-        # self.kl_weight      = getattr(config, "kl_weight", 1e-4)
-        # self.tcc_weight     = getattr(config, "tcc_weight", 1e-2)
-        # self.tv_weight      = getattr(config, "tv_weight", 0.0)     # 可设 1e-3
-        # self.laplace_weight = getattr(config, "laplace_weight", 1e-3)
+        # decoder
+        self.decoder = _extra_process.Decoder_A(self.vae_hidden_dim, config.action_dim, rngs=rngs)
+        
 
     @at.typecheck
     def embed_prefix(
@@ -431,9 +420,8 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b ah"]:
 
         observation = _model.preprocess_observation(None, observation, train=False)
-        rng, eps_z_rng, eps_pad_rng, time_rng, eps_noise_rng, eps_noise_pad_rng, drop_rng = jax.random.split(rng, 7)
+        rng, eps_z_rng, eps_pad_rng, time_rng, eps_noise_pad_rng = jax.random.split(rng, 5)
 
-        drop_flag = (jax.random.uniform(drop_rng, ()) < self.drop_rate)
 
         # ---- 数据 & mask ----
         human_action_data = human_action["data"]                    # [B, Th, D]
@@ -448,9 +436,6 @@ class Pi0(_model.BaseModel):
 
         human_mask = human_mask.astype(bool)
         his_mask   = his_mask.astype(bool)
-        has_human_batch = jnp.any(human_mask)
-        # 训练时有一定概率丢弃 human
-        use_human = jnp.logical_and(has_human_batch, jnp.logical_not(drop_flag))
 
         # ---- 编码到 E ----
         human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0, deterministic=not train)  # [B, Th, E]
@@ -459,54 +444,18 @@ class Pi0(_model.BaseModel):
 
         q_pos_idx = curr_id - his_window_size + 1
         q_pos_start = jnp.clip(q_pos_idx, 0, 1000)
-        # jax.debug.print("q_pos_start = {x}", x=q_pos_start.shape)
-        # ---- Cross-Attention：Q=his_e, KV=human_e ----
-        def build_ctx_with_human(_):
-            ctx, attn = self.cross_enc(his_state_emd, human_state_emd, kv_mask=human_mask, q_mask=his_mask,
-                                    q_pos_start=q_pos_start, kv_pos_start=0, deterministic=not train)                 # ctx:[B, Ts, E]
-            return ctx, attn
-        
-        def build_ctx_without_human(_):
-            dummy_attn = jnp.zeros((his_state_emd.shape[0], 4, his_state_emd.shape[1], human_state_emd.shape[1]))  
-            return his_state_emd, dummy_attn
-        
-        ctx, attn = jax.lax.cond(use_human, build_ctx_with_human, build_ctx_without_human, operand=None)
 
-        # 对齐 action_horizon
+        ctx, attn = self.cross_enc(his_state_emd, human_state_emd, kv_mask=human_mask, q_mask=his_mask,
+                                    q_pos_start=q_pos_start, kv_pos_start=0, deterministic=not train)                 # ctx:[B, Ts, E]
         ah = actions.shape[1]
         Ts = ctx.shape[1]
         assert Ts == ah, f"CrossEncoder 输出长度 Ts={Ts} 必须与 action_horizon ah={ah} 对齐。"
 
-        # ---- VAE: q(z|ctx), p(z|his_e) ----
-        # mu_z, logvar_z = self.post_head(ctx)        # [B, ah, Z]
-        mu_p, logvar_p = self.prior_head(his_state_emd)  # [B, ah, Z]  # his_e 与 ctx 等长（Ts==ah）
-        def post_head_on(_):  return self.post_head(ctx)
-        def post_head_off(_): return (jnp.zeros_like(mu_p), jnp.zeros_like(logvar_p))
-        mu_z, logvar_z = jax.lax.cond(use_human, post_head_on, post_head_off, operand=None)  # [B, ah, Z]
-        
-        beta_small = (kl_weight <= 1e-5)
-        use_prior_z = jnp.logical_or(beta_small,jnp.logical_not(use_human))
-        
-        def sample_prior(_):
-            eps = jax.random.normal(eps_z_rng, mu_p.shape, dtype=mu_p.dtype)
-            return mu_p + jnp.exp(0.5 * logvar_p) * eps
-
-        def sample_posterior(_):
-            eps = jax.random.normal(eps_z_rng, mu_z.shape, dtype=mu_z.dtype)
-            return mu_z + jnp.exp(0.5 * logvar_z) * eps
-
-        z = jax.lax.cond(use_prior_z, sample_prior, sample_posterior, operand=None)  # [B, ah, Z]
-
-        mask_f = his_mask.astype(mu_z.dtype)[..., None]  # [B,ah,1]
-        z = mask_f * z + (1 - mask_f) * jax.random.normal(eps_pad_rng, z.shape, dtype=z.dtype)
-
+        mask_f = his_mask[..., None]  # [B,ah,1]
         # ---- Decoder: (μ_noise, logσ²_noise) ----
-        mu_noise, logvar_noise = self.decoder(ctx, z)    # [B, ah, D]
+        mu_noise = self.decoder(ctx)    # [B, ah, D]
 
-        # 采样噪声作为 FM 初始分布
-        eps   = jax.random.normal(eps_noise_rng, mu_noise.shape, dtype=mu_noise.dtype)
-        std   = jnp.exp(0.5 * logvar_noise)
-        noise = mu_noise + std * eps                     # [B, ah, D]
+        noise = mu_noise
         noise = mask_f * noise + (1 - mask_f) * jax.random.normal(eps_noise_pad_rng, noise.shape, dtype=noise.dtype)
 
         # ---- 采样时间 & 构造 x_t / 目标 u_t（FM）----
@@ -535,27 +484,15 @@ class Pi0(_model.BaseModel):
         # ---- per-step MSE（FM）----
         mse_step = jnp.mean((v_t - u_t) ** 2, axis=-1)                                            # [B, ah]
 
-        def _with_human_step(_):
-            kl_step = _extra_process.kl_balanced_with_freebits(
-                mu_z, logvar_z, mu_p, logvar_p,
-                mask=his_mask, alpha=0.8, free_bits=0.5, reduce="none"  # [B, ah]
-            )
-            tcc_val = _extra_process.tcc_cycle_back_regression(
-                his_state_emd, human_state_emd, mask_u=his_mask, mask_v=human_mask,
-                tau=getattr(self, "tcc_tau", 0.1),
-                lambda_logvar=getattr(self, "tcc_lambda_logvar", 1e-3)   # 标量
-            )
-            tcc_step = jnp.full_like(mse_step, tcc_val)  # 广播到 [B, ah]
-            return kl_step, tcc_step
-
-        def _without_human_step(_):
-            zeros = jnp.zeros_like(mse_step)  # [B, ah]
-            return zeros, zeros
-
-        kl_step, tcc_step = jax.lax.cond(use_human, _with_human_step, _without_human_step, operand=None)
-
-        loss_step = mse_step + kl_weight * kl_step + tcc_weight * tcc_step
-        return {"total": loss_step, "kl": kl_step, "tcc": tcc_step, "kl_weight": kl_weight, "tcc_weight": tcc_weight}  # [B, ah]
+        tcc_val = _extra_process.tcc_cycle_back_regression(
+            his_state_emd, human_state_emd, mask_u=his_mask, mask_v=human_mask,
+            tau=getattr(self, "tcc_tau", 0.1),
+            lambda_logvar=getattr(self, "tcc_lambda_logvar", 1e-3)   # 标量
+        )
+        tcc_step = jnp.full_like(mse_step, tcc_val)  # 广播到 [B, ah]
+        
+        loss_step = mse_step + tcc_weight * tcc_step
+        return {"total": loss_step, "tcc": tcc_step, "kl_weight": kl_weight, "tcc_weight": tcc_weight}  # [B, ah]
 
     @override
     def sample_actions(
@@ -760,20 +697,6 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, rtc_step, (noise, 1.0))
-        # jax.debug.print("x_0, joint 0 = {x}", x=x_0[0][0])
-        # jax.debug.print(
-        #     "x[{b}, :, {j}] = {x}",
-        #     b=0,
-        #     j=0,
-        #     x=x_0[0, :, 0]  
-        # )
-        # jax.debug.print(
-        #     "pre[{b}, :, {j}] = {x}",
-        #     b=0,
-        #     j=0,
-        #     x=prefix_actions[0, :, 0]          # 关键切片：batch 固定、时间全取、关节固定
-        # )
-        # jax.debug.print("previx_actions, joint 0 = {x}", x=prefix_actions[0][0])
         return x_0
      
     @override
@@ -803,44 +726,19 @@ class Pi0(_model.BaseModel):
         human_mask = human_mask.astype(bool)
         his_mask   = his_mask.astype(bool)
         print(human_action_data.shape, his_state_data.shape, human_mask.shape, his_mask.shape)
-        # print(human_mask, his_mask)
         jax.debug.print("human_action_mask = {x}", x=human_mask)
         jax.debug.print("his_state_mask = {x}", x=his_mask)
         jax.debug.print("human_action_data = {x}", x=human_action_data[0, 0, :])
         jax.debug.print("his_state_data = {x}", x=his_state_data[0, 0, :])
         
         his_state_emd = self.state_enc(his_state_data, his_mask, pos_start=state_start, deterministic=True)  # [B, Ts, E]
-        # 走prior路径
-        cond = jnp.any(human_mask)
-        def infer_without_human(_):
-            mu_p, logvar_p = self.prior_head(his_state_emd)
-            eps = jax.random.normal(rng, mu_p.shape, dtype=mu_p.dtype)
-            z = mu_p + jnp.exp(0.5 * logvar_p) * eps
-            mu_noise, logvar_noise = self.decoder(his_state_emd, z)
-            return mu_noise, logvar_noise
-        def infer_with_human(_):
-            human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0, deterministic=True)  # [B, Th, E]
-            ctx, attn = self.cross_enc(his_state_emd, human_state_emd,
-                kv_mask=human_mask, q_mask = his_mask, q_pos_start=state_start, kv_pos_start=0,
-                deterministic=True
-            )  # ctx: [B, Ts(=ah), E]
-            mu_z, logvar_z = self.post_head(ctx)
-            jax.debug.print("mu_z, logvar_z = {x}", x=(mu_z[0, 0, :], logvar_z[0, 0, :]))
-            eps = jax.random.normal(rng, mu_z.shape, dtype=mu_z.dtype)
-            z = mu_z + jnp.exp(0.5 * logvar_z) * eps
-            mu_noise, logvar_noise = self.decoder(ctx, z)
-            return mu_noise, logvar_noise
-        
-        
-        mu_noise, logvar_noise = jax.lax.cond(cond, infer_with_human, infer_without_human, None)
-        jax.debug.print("mu_noise, logvar_noise = {x}", x=(mu_noise[0, 0, :], logvar_noise[0, 0, :]))
-        rng, rng_z, rng_eps_noise = jax.random.split(rng, 3)
-
-        # ---- 采样噪声（元素级）作为 FM 初始分布 ----
-        eps = jax.random.normal(rng_eps_noise, mu_noise.shape, dtype=mu_noise.dtype)  # [B, ah, D]
-        std = jnp.exp(0.5 * logvar_noise)
-        noise = mu_noise + std * eps                                                 # [B, ah, D]
-
+        human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0, deterministic=True)  # [B, Th, E]
+        ctx, attn = self.cross_enc(his_state_emd, human_state_emd,
+            kv_mask=human_mask, q_mask = his_mask, q_pos_start=state_start, kv_pos_start=0,
+            deterministic=True
+        )
+       
+        noise = self.decoder(ctx)
         # ========== Flow Matching 推理积分: 从 t=1 → 0 ==========
         # 1) 先跑 prefix，建立 KV cache
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)   # [B, P, *], [B,P], [B,P]

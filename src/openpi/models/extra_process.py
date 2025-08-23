@@ -423,7 +423,7 @@ class GaussianHead(nnx.Module):
         h = jax.nn.gelu(self.fc1(x))
         h = jax.nn.gelu(self.fc2(h))
         mu = self.mu_head(h)
-        logvar = jnp.clip(self.lv_head(h), -10.0, 5.0)  # 数值稳定
+        logvar = jnp.clip(self.lv_head(h), -5.0, 5.0)  # 数值稳定
         return mu, logvar
 
 class GaussianDecoderMLP(nnx.Module):
@@ -476,3 +476,33 @@ class GaussianDecoderResidual(nnx.Module):
         logvar      = logvar_base + self.lv_res(hz)
         logvar = jnp.clip(logvar, -10.0, 5.0)  # 或 softplus 参数化
         return mu, logvar
+
+class DeterminsticDecoder(nnx.Module):
+    def __init__(self, ctx_dim: int, z_dim: int, out_dim: int, hidden: Optional[int]=None, rngs=None):
+        super().__init__()
+        h = hidden or max(z_dim, out_dim)
+        self.fc1 = nnx.Linear(z_dim, h, rngs=rngs)
+        self.fc2 = nnx.Linear(h, h, rngs=rngs)
+        self.mu_head = nnx.Linear(h, out_dim, rngs=rngs)
+        # self.lv_head = nnx.Linear(h, out_dim, rngs=rngs)
+
+    def __call__(self, ctx: jnp.ndarray, z: jnp.ndarray):
+        h = jax.nn.gelu(self.fc1(z))
+        h = jax.nn.gelu(self.fc2(h))
+        mu = self.mu_head(h)
+        # logvar = jnp.clip(self.lv_head(h), -5.0, 5.0)  # 数值稳定
+        return mu, None
+
+
+class Decoder_A(nnx.Module):
+    def __init__(self, ctx_dim: int, out_dim: int, hidden: Optional[int]=None, rngs=None):
+        super().__init__()
+        h = hidden or out_dim
+        self.fc1 = nnx.Linear(ctx_dim, h, rngs=rngs)
+        self.fc2 = nnx.Linear(h, h, rngs=rngs)
+        self.out_proj = nnx.Linear(h, out_dim, rngs=rngs)
+
+    def __call__(self, ctx: jnp.ndarray):
+        h = jax.nn.gelu(self.fc1(ctx))
+        h = jax.nn.gelu(self.fc2(h))
+        return self.out_proj(h)

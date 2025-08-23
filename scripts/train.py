@@ -192,11 +192,11 @@ def train_step(
     model.train()
 
     step_scalar = jnp.array(state.step, dtype=jnp.float32)
-    N = 200  # 每 N 步调整一次
+    N = 10  # 每 N 步调整一次
 
     # 基线 warmup（阶梯式）
     beta_kl_base = cosine_warmup_stair(step_scalar, 2_000, 1e-3, N)
-    w_tcc_base   = cosine_warmup_stair(step_scalar, 2_000, 1e-4, N)
+    w_tcc_base   = cosine_warmup_stair(step_scalar, 2_000, 1e-3, N)
     
     beta_kl = jnp.maximum(beta_kl_base, 5e-6)
 
@@ -211,15 +211,13 @@ def train_step(
         # 若 total 不是标量，这里做一次 mean 以稳定
         total_scal = jnp.mean(loss_dict["total"])
 
-        kl_scal  = jnp.mean(loss_dict["kl"])   # [B, T] → 标量
         tcc_scal = jnp.mean(loss_dict["tcc"])            # 已是标量（若不是，改成 jnp.mean(loss_dict["tcc"]))
 
-        # 若没有显式 main，则用 total - w*kl - w*tcc 还原
         main_scal = loss_dict.get(
             "main",
-            total_scal - loss_dict["kl_weight"] * kl_scal - loss_dict["tcc_weight"] * tcc_scal
+            total_scal - loss_dict["tcc_weight"] * tcc_scal
         )
-        return main_scal, kl_scal, tcc_scal, loss_dict
+        return main_scal, tcc_scal, loss_dict
 
     # ---------- 每 N 步做一次“梯度占比自适应” ----------
     target_ratio_kl, target_ratio_tcc = 0.2, 0.2
@@ -243,29 +241,25 @@ def train_step(
         _ = forward_components_model(model, rng_adj, beta_kl_base, w_tcc_base)
 
         Gm  = gnorm_of(rng_main, lambda m, r: forward_components_model(m, r, beta_kl_base, w_tcc_base)[0])
-        Gkl = gnorm_of(rng_kl,   lambda m, r: forward_components_model(m, r, beta_kl_base, w_tcc_base)[1])
-        Gtc = gnorm_of(rng_tcc,  lambda m, r: forward_components_model(m, r, beta_kl_base, w_tcc_base)[2])
+        Gtc = gnorm_of(rng_tcc,  lambda m, r: forward_components_model(m, r, beta_kl_base, w_tcc_base)[1])
 
-        scale_kl  = (target_ratio_kl  * Gm) / (Gkl + eps)
         scale_tcc = (target_ratio_tcc * Gm) / (Gtc + eps)
 
-        beta_kl = jnp.clip(beta_kl_base * (scale_kl  ** eta), 1e-6, 1e-1)
         w_tcc   = jnp.clip(w_tcc_base   * (scale_tcc ** eta), 1e-8, 1e-2)
-        return beta_kl, w_tcc
+        return  w_tcc
 
     def _keep_weights(_):
-        return beta_kl_base, w_tcc_base
+        return w_tcc_base
 
     do_adjust = (jnp.mod(state.step, N) == 0)
-    beta_kl, w_tcc = jax.lax.cond(do_adjust, _adjust_weights, _keep_weights, operand=None)
+    w_tcc = jax.lax.cond(do_adjust, _adjust_weights, _keep_weights, operand=None)
 
     # ---------- 正式一次前向 + 反向（用调整后的权重） ----------
     @at.typecheck
     def loss_fn_extra(m: _model.BaseModel, rng_in, observation, actions, human_action, his_state):
-        main_scal, kl_scal, tcc_scal, loss_dict = forward_components_model(m, rng_in, beta_kl, w_tcc)
-        # 训练用总损失：直接用 loss_dict["total"]（已含权重）
+        main_scal, tcc_scal, loss_dict = forward_components_model(m, rng_in, beta_kl, w_tcc)
         total_scal = jnp.mean(loss_dict["total"])
-        return total_scal, {"loss_dict": loss_dict, "main": main_scal, "kl": kl_scal, "tcc": tcc_scal}
+        return total_scal, {"loss_dict": loss_dict, "main": main_scal, "tcc": tcc_scal}
 
     train_rng = jax.random.fold_in(rng, state.step)
     (total_loss, aux), grads = nnx.value_and_grad(loss_fn_extra, argnums=diff_state, has_aux=True)(
@@ -303,7 +297,6 @@ def train_step(
     info = {
         "loss": total_loss,
         "main_loss": aux["main"],
-        "kl_loss": aux["kl"],
         "tcc_loss": aux["tcc"],
         "kl_weight": beta_kl,
         "tcc_weight": w_tcc,
