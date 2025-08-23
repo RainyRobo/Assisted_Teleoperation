@@ -444,6 +444,7 @@ class Pi0(_model.BaseModel):
         curr_id = his_state["curr_id"]
         his_window_size = 50
 
+        # TODO 检查窗口对不对
         his_state_data, his_mask = _extra_process.get_history_window(his_state_data, his_mask, curr_id, his_window_size)
 
         human_mask = human_mask.astype(bool)
@@ -456,7 +457,7 @@ class Pi0(_model.BaseModel):
         human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0, deterministic=not train)  # [B, Th, E]
         his_state_emd   = self.state_enc(his_state_data,    his_mask,   pos_start=0, deterministic=not train)  # [B, Ts, E]
 
-
+        # TODO 测试窗口index
         q_pos_idx = curr_id - his_window_size + 1
         q_pos_start = jnp.clip(q_pos_idx, 0, 1000)
         # jax.debug.print("q_pos_start = {x}", x=q_pos_start.shape)

@@ -441,6 +441,8 @@ class GaussianDecoderMLP(nnx.Module):
         h = jax.nn.gelu(self.fc1(x))
         h = jax.nn.gelu(self.fc2(h))
         mu = self.mu_head(h)
+        
+        # TODO 修改区间
         logvar = jnp.clip(self.lv_head(h), -10.0, 5.0)
         return mu, logvar
 

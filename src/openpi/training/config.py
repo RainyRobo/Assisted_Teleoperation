@@ -709,7 +709,7 @@ _CONFIGS = [
         name="pi0_piper_pen_uncap_low_mem_finetune",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAlohaDataConfig(
-            repo_id="RainyBot/teleoperation_uncap_pen",
+            repo_id="RainyBot/Piper_Uncap_Pen",
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
                 asset_id="trossen",
