@@ -52,7 +52,7 @@ class CheckpointWeightLoader(WeightLoader):
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
         # Add all missing LoRA weights.
         # return _merge_params(loaded_params, params, missing_regex=".*lora.*")
-        return _merge_params(loaded_params, params, missing_regex=r".*(lora|state_enc|cross_enc|post_head|prior_head|decoder).*")
+        return _merge_params(loaded_params, params, missing_regex=r".*(lora|state_enc|cross_enc|post_head|prior_head|decoder|cond_emd|cross_gate).*")
 
 
 @dataclasses.dataclass(frozen=True)

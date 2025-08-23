@@ -150,14 +150,7 @@ class Pi0Config(_model.BaseModelConfig):
     action_dim: int = 32
     action_horizon: int = 50
     max_token_len: int = 48
-    latent_dim: int = 16
-    
-    kl_weight: float = 1e-4
-    tcc_weight: float = 1e-2
-    
-    kl_warmup_steps: int = 5_000
-    tcc_warmup_steps: int = 5_000
-
+    latent_dim: int = 8
 
     @property
     @override
@@ -224,7 +217,7 @@ class Pi0Config(_model.BaseModelConfig):
             )
         
         keep_new_modules = nnx_utils.PathRegex(
-            r".*(state_enc|cross_enc|post_head|prior_head|decoder).*"
+            r".*(state_enc|cross_enc|post_head|prior_head|decoder|cond_emd|cross_gate).*"
         )
         filters.append(nnx.Not(keep_new_modules))
         if not filters:
@@ -262,29 +255,25 @@ class Pi0(_model.BaseModel):
         self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
         
-        self.vae_hidden_dim = 256
+        self.vae_hidden_dim = 128
         
-                # encoders
+        # encoders
         self.state_enc = _extra_process.StateEncoder(config.action_dim, self.vae_hidden_dim,
-                                      num_heads=4, n_layers=3, rngs=rngs)
+                                      num_heads=4, n_layers=2, rngs=rngs)
         self.cross_enc = _extra_process.CrossEncoder(self.vae_hidden_dim,
                                       num_heads=4, use_rope=True, rngs=rngs)
 
         # VAE heads
         self.post_head  = _extra_process.GaussianHead(self.vae_hidden_dim, config.latent_dim, rngs=rngs)  # q(z|ctx)
         self.prior_head = _extra_process.GaussianHead(self.vae_hidden_dim, config.latent_dim, rngs=rngs)  # p(z|his_e)
-        # self.decoder    = _extra_process.GaussianDecoderMLP(ctx_dim=self.vae_hidden_dim,
-        #                                      z_dim=config.latent_dim,
-        #                                      out_dim=config.action_dim,
-        #                                      rngs=rngs)
         self.decoder = _extra_process.GaussianDecoderResidual(self.vae_hidden_dim, config.latent_dim, config.action_dim, rngs=rngs)
-        self.drop_rate = 0.2
-        # loss weights（从 config 读取或给默认）
-        # self.kl_weight      = getattr(config, "kl_weight", 1e-4)
-        # self.tcc_weight     = getattr(config, "tcc_weight", 1e-2)
-        # self.tv_weight      = getattr(config, "tv_weight", 0.0)     # 可设 1e-3
-        # self.laplace_weight = getattr(config, "laplace_weight", 1e-3)
-
+        self.drop_rate = 0.1
+        
+        # 
+        self.cond_emd = _extra_process.CondEmbed(latent_dim=config.latent_dim, action_dim=config.action_dim, emb_dim=2 * action_expert_config.width, num_cond_tokens=1, drop_p=0.2, rngs=rngs)
+        self.cross_gate = _extra_process.CrossGate(embed_dim=self.vae_hidden_dim, mode="global", hidden_mult=0.5, drop_rate=0.1, temp=1.0, sparsity=1e-3, rngs=rngs,)
+        self.consistency_prob = 0.3
+        self.consistency_lambda = 0.01
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
@@ -431,7 +420,7 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b ah"]:
 
         observation = _model.preprocess_observation(None, observation, train=False)
-        rng, eps_z_rng, eps_pad_rng, time_rng, eps_noise_rng, eps_noise_pad_rng, drop_rng = jax.random.split(rng, 7)
+        rng, eps_z_rng, eps_pad_rng, time_rng, eps_noise_rng, eps_noise_pad_rng, drop_rng, cond_rng = jax.random.split(rng, 8)
 
         drop_flag = (jax.random.uniform(drop_rng, ()) < self.drop_rate)
 
@@ -464,13 +453,22 @@ class Pi0(_model.BaseModel):
         def build_ctx_with_human(_):
             ctx, attn = self.cross_enc(his_state_emd, human_state_emd, kv_mask=human_mask, q_mask=his_mask,
                                     q_pos_start=q_pos_start, kv_pos_start=0, deterministic=not train)                 # ctx:[B, Ts, E]
-            return ctx, attn
+           
+            ctx_gated, g, reg_gate = self.cross_gate(
+                his_e=his_state_emd, human_e=human_state_emd,
+                his_mask=his_mask, human_mask=human_mask,
+                base_ctx=his_state_emd, cross_ctx=ctx,
+                rngs=nnx.Rngs(dropout=drop_rng), train=train
+            )
+            return ctx_gated, attn, g, reg_gate
         
         def build_ctx_without_human(_):
-            dummy_attn = jnp.zeros((his_state_emd.shape[0], 4, his_state_emd.shape[1], human_state_emd.shape[1]))  
-            return his_state_emd, dummy_attn
+            dummy_attn = jnp.zeros((his_state_emd.shape[0], 4, his_state_emd.shape[1], human_state_emd.shape[1]))
+            g = jnp.zeros((his_state_emd.shape[0], 1, 1), dtype=his_state_emd.dtype)
+            reg_gate = jnp.array(0.0, dtype=his_state_emd.dtype)  
+            return his_state_emd, dummy_attn, g, reg_gate
         
-        ctx, attn = jax.lax.cond(use_human, build_ctx_with_human, build_ctx_without_human, operand=None)
+        ctx, attn, gate_g, reg_gate = jax.lax.cond(use_human, build_ctx_with_human, build_ctx_without_human, operand=None)
 
         # 对齐 action_horizon
         ah = actions.shape[1]
@@ -516,25 +514,40 @@ class Pi0(_model.BaseModel):
         x_t = t * noise + (1.0 - t) * actions           # [B, ah, D]
         u_t = noise - actions                            # [B, ah, D]
 
+        # ---- conditional embedding tokens ----
+        cond_tokens, cond_mask = self.cond_emd(z, mu_noise, logvar_noise, rngs=cond_rng, train=train)  # [B, 1, E]
+
         # ---- LLM 前向（保持你原逻辑）----
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)               # [B,P,*]
+        
+        new_prefix_tokens = jnp.concatenate([cond_tokens, prefix_tokens], axis=1)  # [B,P+ah+1,*]
+        new_prefix_mask = jnp.concatenate([cond_mask, prefix_mask], axis=1)    # [B,P+ah+1]
+        
+        cond_ar_mask = jnp.zeros((1,))
+        new_prefix_ar_mask = jnp.concatenate([cond_ar_mask, prefix_ar_mask], axis=0)  # [B,P+ah+1]
+        
         suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)    # [B,ah+1,*]
 
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask    = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)                    # [B,P+S]
+        input_mask = jnp.concatenate([new_prefix_mask, suffix_mask], axis=1)
+        ar_mask    = jnp.concatenate([new_prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask_llm  = make_attn_mask(input_mask, ar_mask)
         positions  = jnp.cumsum(input_mask.astype(jnp.int32), axis=1) - 1
 
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens],
+            [new_prefix_tokens, suffix_tokens],
             mask=attn_mask_llm,
             positions=positions,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])                          # [B, ah, D]
 
         # ---- per-step MSE（FM）----
-        mse_step = jnp.mean((v_t - u_t) ** 2, axis=-1)                                            # [B, ah]
-
+        sigma2 = jnp.exp(logvar_noise)
+        res = v_t - u_t
+        nll = (res)**2 / sigma2 + jnp.log(sigma2)
+        mse_step = jnp.sum(nll, axis=-1)  # [B, ah]
+        step_mask = mask_f.squeeze(-1).astype(mse_step.dtype)
+        mse_step = (mse_step * step_mask) / (jnp.sum(step_mask, axis=1, keepdims=True) + 1e-8)
+        
         def _with_human_step(_):
             kl_step = _extra_process.kl_balanced_with_freebits(
                 mu_z, logvar_z, mu_p, logvar_p,
@@ -553,9 +566,44 @@ class Pi0(_model.BaseModel):
             return zeros, zeros
 
         kl_step, tcc_step = jax.lax.cond(use_human, _with_human_step, _without_human_step, operand=None)
+        
+        def do_consistency(_):
+            # g=0 / 无 human 路径：ctx0=his_state_emd，z0 用 prior，cond0 基于 (z0, mu0, logvar0)
+            eps_z0 = jax.random.normal(eps_z_rng, mu_p.shape, dtype=mu_p.dtype)  # 共享 rng 以降方差（简化）
+            z0 = mu_p + jnp.exp(0.5 * logvar_p) * eps_z0
+            mu0, logv0 = self.decoder(his_state_emd, z0)
 
-        loss_step = mse_step + kl_weight * kl_step + tcc_weight * tcc_step
-        return {"total": loss_step, "kl": kl_step, "tcc": tcc_step, "kl_weight": kl_weight, "tcc_weight": tcc_weight}  # [B, ah]
+            # 用“相同的 x_t（主分支的）”做 suffix，保证比较同一点的速度场
+            cond0, mask0 = self.cond_emd(z0, mu0, logv0, rngs=cond_rng, train=train)
+
+            new_pref_tok0  = jnp.concatenate([cond0, prefix_tokens], axis=1)
+            new_pref_mask0 = jnp.concatenate([mask0,  prefix_mask],  axis=1)
+            new_pref_ar0   = jnp.concatenate([jnp.zeros((1, )), prefix_ar_mask], axis=0)
+
+            in_mask0 = jnp.concatenate([new_pref_mask0, suffix_mask], axis=1)
+            ar_mask0 = jnp.concatenate([new_pref_ar0,   suffix_ar_mask], axis=0)
+            attn0    = make_attn_mask(in_mask0, ar_mask0)
+            pos0     = jnp.cumsum(in_mask0.astype(jnp.int32), axis=1) - 1
+
+            (_, suffix_out0), _ = self.PaliGemma.llm(
+                [new_pref_tok0, suffix_tokens],  # suffix_tokens 复用主分支（同 x_t, t）
+                mask=attn0,
+                positions=pos0,
+            )
+            v_t0 = self.action_out_proj(suffix_out0[:, -self.action_horizon:])  # [B,ah,D]
+
+            # 一致性损失：按 (1 - g) 加权（g 大时少约束，g 小时逼近 no-human）
+            w_cons = (1.0 - gate_g).astype(v_t.dtype)            # [B,1,1]
+            w_cons = jnp.broadcast_to(w_cons, v_t.shape)         # [B,ah,D]
+            cons = jnp.mean(((v_t - v_t0) ** 2) * w_cons, axis=-1)  # [B,ah]
+            cons = (cons * step_mask) / (jnp.sum(step_mask, axis=1, keepdims=True) + 1e-8)
+            return cons
+        
+        do_cons = train & (jax.random.uniform(drop_rng, ()) < self.consistency_prob)
+        cons_step = jax.lax.cond(do_cons, do_consistency, lambda _: jnp.zeros_like(mse_step), operand=None)
+
+        loss_step = mse_step + kl_weight * kl_step + tcc_weight * tcc_step + reg_gate +  self.consistency_lambda * cons_step
+        return {"total": loss_step, "kl": kl_step, "tcc": tcc_step, "kl_weight": kl_weight, "tcc_weight": tcc_weight, "reg_gate": reg_gate, "consistency": cons_step}  # [B, ah]
 
     @override
     def sample_actions(
@@ -786,101 +834,112 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
     ) -> _model.Actions:  # [B, ah, D]
+        assert num_steps > 0
+        dt = -1.0 / num_steps           # 从 t=1 积分到 0
         # 预处理
         observation = _model.preprocess_observation(None, observation, train=False)
-        dt = -1.0 / num_steps  # 从 t=1 走到 0
-        assert num_steps > 0
-        
-        batch_size = 1
 
         # ---- 取数据 ----
-        human_action_data = human_action["data"]                    # [B, Th, D_in]
-        his_state_data    = his_state["data"]                      # [B, Ts, D_in]
-        human_mask        = human_action["mask"]                   # [B, jnp.ones(human_action_data.shape[:2], bool))
-        his_mask          = his_state["mask"]
+        human_action_data = human_action["data"]          # [B, Th, D_in]
+        his_state_data    = his_state["data"]             # [B, Ts, D_in]
+        human_mask        = human_action.get("mask", jnp.ones(human_action_data.shape[:2], bool))
+        his_mask          = his_state.get("mask",   jnp.ones(his_state_data.shape[:2], bool))
         state_start       = his_state["curr_id"]
 
         human_mask = human_mask.astype(bool)
         his_mask   = his_mask.astype(bool)
-        print(human_action_data.shape, his_state_data.shape, human_mask.shape, his_mask.shape)
-        # print(human_mask, his_mask)
-        jax.debug.print("human_action_mask = {x}", x=human_mask)
-        jax.debug.print("his_state_mask = {x}", x=his_mask)
-        jax.debug.print("human_action_data = {x}", x=human_action_data[0, 0, :])
-        jax.debug.print("his_state_data = {x}", x=his_state_data[0, 0, :])
-        
-        his_state_emd = self.state_enc(his_state_data, his_mask, pos_start=state_start, deterministic=True)  # [B, Ts, E]
-        # 走prior路径
-        cond = jnp.any(human_mask)
+        B = his_state_data.shape[0]
+        batch_size = B
+
+        his_window_size = 50
+        his_state_data, his_mask = _extra_process.get_history_window(
+            his_state_data, his_mask, state_start, his_window_size
+        )
+
+        # ---- 编码到 E ----
+        his_state_emd = self.state_enc(his_state_data, his_mask, pos_start=0, deterministic=True)  # [B, Ts, E]
+
+        # ---- prior / posterior 路径 ----
+        cond = jnp.any(human_mask)  # batch 内只要有 human 就走 posterior
         def infer_without_human(_):
-            mu_p, logvar_p = self.prior_head(his_state_emd)
+            mu_p, logvar_p = self.prior_head(his_state_emd)               # [B, ah, Z]
             eps = jax.random.normal(rng, mu_p.shape, dtype=mu_p.dtype)
             z = mu_p + jnp.exp(0.5 * logvar_p) * eps
-            mu_noise, logvar_noise = self.decoder(his_state_emd, z)
-            return mu_noise, logvar_noise
+            mu_noise, logvar_noise = self.decoder(his_state_emd, z)       # ctx=his_state_emd
+            return z, mu_noise, logvar_noise
+
         def infer_with_human(_):
             human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0, deterministic=True)  # [B, Th, E]
-            ctx, attn = self.cross_enc(his_state_emd, human_state_emd,
-                kv_mask=human_mask, q_mask = his_mask, q_pos_start=state_start, kv_pos_start=0,
-                deterministic=True
-            )  # ctx: [B, Ts(=ah), E]
-            mu_z, logvar_z = self.post_head(ctx)
-            jax.debug.print("mu_z, logvar_z = {x}", x=(mu_z[0, 0, :], logvar_z[0, 0, :]))
+            ctx, _ = self.cross_enc(
+                his_state_emd, human_state_emd,
+                kv_mask=human_mask, q_mask=his_mask,
+                q_pos_start=0, kv_pos_start=0, deterministic=True
+            )                                                            # ctx: [B, Ts(=ah), E]
+            mu_z, logvar_z = self.post_head(ctx)                         # [B, ah, Z]
             eps = jax.random.normal(rng, mu_z.shape, dtype=mu_z.dtype)
             z = mu_z + jnp.exp(0.5 * logvar_z) * eps
             mu_noise, logvar_noise = self.decoder(ctx, z)
-            return mu_noise, logvar_noise
-        
-        
-        mu_noise, logvar_noise = jax.lax.cond(cond, infer_with_human, infer_without_human, None)
-        jax.debug.print("mu_noise, logvar_noise = {x}", x=(mu_noise[0, 0, :], logvar_noise[0, 0, :]))
-        rng, rng_z, rng_eps_noise = jax.random.split(rng, 3)
+            return z, mu_noise, logvar_noise
 
-        # ---- 采样噪声（元素级）作为 FM 初始分布 ----
-        eps = jax.random.normal(rng_eps_noise, mu_noise.shape, dtype=mu_noise.dtype)  # [B, ah, D]
-        std = jnp.exp(0.5 * logvar_noise)
-        noise = mu_noise + std * eps                                                 # [B, ah, D]
+        z, mu_noise, logvar_noise = jax.lax.cond(cond, infer_with_human, infer_without_human, operand=None)
 
-        # ========== Flow Matching 推理积分: 从 t=1 → 0 ==========
-        # 1) 先跑 prefix，建立 KV cache
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)   # [B, P, *], [B,P], [B,P]
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)                # [B, P, P]
-        positions_prefix = jnp.cumsum(prefix_mask.astype(jnp.int32), axis=1) - 1      # [B, P]
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions_prefix)
+        # ---- 采样噪声作为 x(1) ----
+        rng, rng_eps_noise = jax.random.split(rng)
+        eps  = jax.random.normal(rng_eps_noise, mu_noise.shape, dtype=mu_noise.dtype)
+        std  = jnp.exp(0.5 * logvar_noise)
+        noise = mu_noise + std * eps                                      # x(1) [B, ah, D]
 
-        # 2) 迭代函数
-        def step(carry):
-            x_t, time = carry  # x_t: [B, ah, D], time: 标量
-            # embed_suffix 可能需要每个样本的时间标量，准备一个 [B] 的向量
-            time_vec = jnp.full((batch_size,), time, dtype=jnp.float32)
+        # ================== 构建 [COND | PREFIX] 并建立 KV cache ==================
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)     # [B,P,E], [B,P], [B,P]
+        # 用与训练一致的 cond_embed（time 这里取常数 1.0 即可；它只作为条件上下文）
 
-            suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time_vec)  # [B,S,*], [B,S], [B,S]
-            # suffix 自身的因果/结构 mask
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)                              # [B, S, S]
-            # prefix→suffix 的可见性：把 prefix_mask 扩成 [B, S, P]
-            prefix_to_suffix_mask = jnp.broadcast_to(prefix_mask[:, None, :], (batch_size, suffix_tokens.shape[1], prefix_mask.shape[1]))
-            # 合并：suffix 查询到 (prefix + suffix) 的注意力掩码 → [B, S, P+S]
-            full_attn_mask = jnp.concatenate([prefix_to_suffix_mask, suffix_attn_mask], axis=-1)
+        cond_tokens, cond_mask = self.cond_emd(z, mu_noise, logvar_noise, train=False)   # [B,K,E], [B,K]
+        cond_ar_mask = jnp.zeros_like(cond_mask)
 
-            # positions：suffix 的位置紧接在 prefix 之后
-            positions_suffix = jnp.sum(prefix_mask, axis=-1, dtype=jnp.int32)[:, None] + \
+        # 把条件放最前（[COND | PREFIX]），并按 token 维 axis=1 拼接 AR mask
+        new_prefix_tokens   = jnp.concatenate([cond_tokens, prefix_tokens], axis=1)     # [B,K+P,E]
+        new_prefix_mask     = jnp.concatenate([cond_mask,   prefix_mask],   axis=1)     # [B,K+P]
+        new_prefix_ar_mask  = jnp.concatenate([cond_ar_mask, prefix_ar_mask], axis=1)   # [B,K+P]
+
+        prefix_attn_mask = make_attn_mask(new_prefix_mask, new_prefix_ar_mask)          # [B,K+P,K+P]
+        positions_prefix = jnp.cumsum(new_prefix_mask.astype(jnp.int32), axis=1) - 1    # [B,K+P]
+
+        # 只跑 prefix，建立 KV cache
+        _, kv_cache = self.PaliGemma.llm([new_prefix_tokens, None], mask=prefix_attn_mask, positions=positions_prefix)
+
+        # ================== FM 推理积分：从 t=1 → 0 ==================
+        def step_fn(carry, i):
+            x_t = carry                                 # [B, ah, D]
+            # 当前时间（均匀 Euler）
+            t_now = 1.0 + (i * dt)                      # i=0 -> t=1.0
+            time_vec = jnp.full((batch_size,), t_now, dtype=jnp.float32)
+
+            # suffix 编码
+            suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time_vec)  # [B,S,E], [B,S], [B,S]
+
+            # 构造 suffix 的注意力掩码（让其可见到 [COND|PREFIX] 与自身的因果结构）
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)                              # [B,S,S]
+            prefix_to_suffix = jnp.broadcast_to(new_prefix_mask[:, None, :], (batch_size, suffix_tokens.shape[1], new_prefix_mask.shape[1]))  # [B,S,K+P]
+            full_attn_mask   = jnp.concatenate([prefix_to_suffix, suffix_attn_mask], axis=-1)          # [B,S,K+P+S]
+
+            # positions：suffix 紧接在 prefix 后
+            positions_suffix = jnp.sum(new_prefix_mask, axis=-1, dtype=jnp.int32)[:, None] + \
                             jnp.cumsum(suffix_mask.astype(jnp.int32), axis=-1) - 1
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            # 只前向 suffix（复用 KV cache）
+            (_, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
                 positions=positions_suffix,
                 kv_cache=kv_cache
             )
-            # 只取 suffix_out，并映射出 v_t
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])  # [B, ah, D]
-            return (x_t + dt * v_t, time + dt)
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])   # [B, ah, D]
 
-        def cond(carry):
-            _, time = carry
-            # 由于 dt < 0，从 1 递减；这里用一个小裕量避免浮点误差
-            return time >= -dt * 0.5
+            x_next = x_t + dt * v_t
+            return x_next, None
 
-        # 初值：x(1) = noise
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0  # [B, ah, D]
+        # 用 fori_loop 更稳（避免 while 的浮点边界）
+        x_1 = noise
+        x_T, _ = jax.lax.fori_loop(0, num_steps, step_fn, x_1)
+
+        return x_T  # [B, ah, D]

@@ -476,3 +476,170 @@ class GaussianDecoderResidual(nnx.Module):
         logvar      = logvar_base + self.lv_res(hz)
         logvar = jnp.clip(logvar, -10.0, 5.0)  # 或 softplus 参数化
         return mu, logvar
+
+class CondEmbed(nnx.Module):
+    def __init__(self, *, latent_dim, action_dim,
+                 emb_dim, num_cond_tokens=2, drop_p=0.2, rngs: nnx.Rngs):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.num_cond_tokens = num_cond_tokens
+        self.drop_p = drop_p
+        self.in_dim = latent_dim + 2*action_dim
+
+        self.ln   = nnx.LayerNorm(self.in_dim, rngs=rngs)
+        self.fc1  = nnx.Linear(self.in_dim, emb_dim, rngs=rngs)
+        self.fc2  = nnx.Linear(emb_dim, num_cond_tokens * emb_dim, rngs=rngs)
+        self.drop = nnx.Dropout(rate=drop_p)
+
+    def __call__(self, z, mu_noise, logvar_noise, *, rngs: nnx.Rngs, train: bool):
+        """
+        z, mu_noise, logvar_noise: [B, ah, *]
+        t: [B] 或 [B,1,1]
+        return:
+          cond_tokens: [B, K, emb_dim]
+          cond_mask:   [B, K] (bool)
+        """
+        B, ah = z.shape[:2]
+
+        feat = jnp.concatenate([z, mu_noise, logvar_noise], axis=-1)  # [B, ah, F]
+        feat = self.ln(feat)                                               # [B, ah, F]
+
+        # 池化成全局条件向量（也可替换为 attention pooling）
+        cond_vec = jnp.mean(feat, axis=1)                                  # [B, F]
+
+        # 小 MLP -> K*E
+        h = jax.nn.relu(self.fc1(cond_vec))                                # [B, 2E]
+        cond_flat = self.fc2(h)                                            # [B, K*E]
+        cond_tokens = cond_flat.reshape(B, self.num_cond_tokens, self.emb_dim)  # [B, K, E]
+
+        # 条件 dropout（整段 token 的按样本屏蔽）
+        if train:
+            # 这里用 Dropout 的“按元素”mask；想“整段屏蔽”可改为样本级 Bernoulli 再广播
+            cond_tokens = self.drop(cond_tokens, rngs=nnx.Rngs(dropout=rngs), deterministic=not train)
+
+        cond_mask = jnp.ones((B, self.num_cond_tokens), dtype=bool)
+        return cond_tokens, cond_mask
+    
+from typing import Literal, Tuple, Optional
+
+def masked_mean(x: jnp.ndarray, m: jnp.ndarray) -> jnp.ndarray:
+    """x:[B,T,E], m:[B,T] -> [B,E]"""
+    w = m.astype(x.dtype)[..., None]
+    return (x * w).sum(axis=1) / (w.sum(axis=1) + 1e-8)
+
+class CrossGate(nnx.Module):
+    """
+    对 cross-attn 输出做门控: ctx = base + g * (cross - base)
+
+    mode:
+      - "global": 每个样本一个 gate 标量 g ∈ [0,1], 形状 [B,1,1]（稳，推荐）
+      - "per_step": 每个时间步一个 gate g_t ∈ [0,1], 形状 [B,T,1]（表达力强）
+
+    超参:
+      - hidden_mult: gate MLP 隐层宽度倍率（相对 E）
+      - drop_rate:   样本级 gate-drop 概率（训练时随机将 g->0）
+      - temp:        gate 温度（越小越接近硬）
+      - sparsity:    稀疏正则系数，对 E[g] 做 L1（让不必要时 g 更小）
+
+    输入:
+      - his_e:[B,T,E], human_e:[B,Th,E], his_mask:[B,T], human_mask:[B,Th]
+      - base_ctx:[B,T,E]   （一般是 his_e）
+      - cross_ctx:[B,T,E]  （cross-enc 的输出）
+
+    返回:
+      - ctx_gated:[B,T,E]
+      - g: [B,1,1] (global) 或 [B,T,1] (per_step)
+      - reg: 标量正则项（稀疏 + gate-drop 的 KL 等，可自行扩展，这里仅 L1）
+    """
+    mode: Literal["global", "per_step"] = "global"
+    hidden_mult: float = 0.5
+    drop_rate: float = 0.0
+    temp: float = 1.0
+    sparsity: float = 0.0
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,          # E
+        mode: Literal["global","per_step"]="global",
+        hidden_mult: float = 0.5,
+        drop_rate: float = 0.0,
+        temp: float = 1.0,
+        sparsity: float = 0.0,
+        rngs: nnx.Rngs,
+    ):
+        super().__init__()
+        self.mode = mode
+        self.hidden_mult = hidden_mult
+        self.drop_rate = drop_rate
+        self.temp = temp
+        self.sparsity = sparsity
+        H = max(1, int(embed_dim * hidden_mult))
+
+        if mode == "global":
+            # 输入特征 3E → H
+            self.fc1 = nnx.Linear(in_features=3*embed_dim, out_features=H, rngs=rngs)
+            # H → 1
+            self.fc2 = nnx.Linear(in_features=H, out_features=1, rngs=rngs)
+        else:
+            # per_step 一样是 3E → H → 1
+            self.fc1 = nnx.Linear(in_features=3*embed_dim, out_features=H, rngs=rngs)
+            self.fc2 = nnx.Linear(in_features=H, out_features=1, rngs=rngs)
+
+        self.drop = nnx.Dropout(rate=self.drop_rate)
+
+    def __call__(
+        self,
+        his_e: jnp.ndarray,            # [B,T,E]
+        human_e: jnp.ndarray,          # [B,Th,E]
+        his_mask: jnp.ndarray,         # [B,T]
+        human_mask: jnp.ndarray,       # [B,Th]
+        base_ctx: jnp.ndarray,         # [B,T,E]
+        cross_ctx: jnp.ndarray,        # [B,T,E]
+        *,
+        rngs: nnx.Rngs,
+        train: bool,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        B, T, E = his_e.shape
+
+        # 1) 构造 gate 的输入特征
+        hq = masked_mean(his_e,   his_mask)          # [B,E]
+        hk = masked_mean(human_e, human_mask)        # [B,E]
+        if self.mode == "global":
+            feat = jnp.concatenate([hq, hk, jnp.abs(hq - hk)], axis=-1)  # [B,3E]
+            h = jax.nn.relu(self.fc1(feat))                              # [B,H]
+            logit = self.fc2(h)                                          # [B,1]
+            g = jax.nn.sigmoid(logit / self.temp)                        # [B,1]
+            g = g[..., None]                                             # [B,1,1]
+        else:
+            # per_step：广播 human 池化向量到 T，再与 his_e 逐步拼接
+            hk_T = jnp.broadcast_to(hk[:, None, :], (B, T, E))           # [B,T,E]
+            feat = jnp.concatenate([his_e, hk_T, jnp.abs(his_e - hk_T)], axis=-1)  # [B,T,3E]
+            h = jax.nn.relu(self.fc1(feat))                              # [B,T,H]
+            logit = self.fc2(h)                                          # [B,T,1]
+            g = jax.nn.sigmoid(logit / self.temp)                        # [B,T,1]
+
+        # 2) gate-drop（样本级；训练期生效）
+        if train and self.drop_rate > 0.0:
+            key = rngs.dropout()
+            if self.mode == "global":
+                keep = (jax.random.uniform(key, (B, 1, 1)) > self.drop_rate).astype(g.dtype)
+            else:
+                # 逐步门控也用样本级随机关断，更稳；如需逐步关断可改成 (B,T,1)
+                keep = (jax.random.uniform(key, (B, 1, 1)) > self.drop_rate).astype(g.dtype)
+            g = g * keep
+
+        # 3) 应用门控
+        ctx = base_ctx + g * (cross_ctx - base_ctx)   # [B,T,E]
+
+        # 4) 稀疏正则（可选）：L1 惩罚 E[g]
+        reg = jnp.array(0.0, dtype=ctx.dtype)
+        if self.sparsity > 0.0:
+            if self.mode == "global":
+                reg = self.sparsity * jnp.mean(jnp.abs(g))               # 标量
+            else:
+                # mask-aware：只在有效步上计算平均 gate
+                w = his_mask[..., None].astype(g.dtype)                  # [B,T,1]
+                reg = self.sparsity * jnp.sum(jnp.abs(g) * w) / (jnp.sum(w) + 1e-8)
+
+        return ctx, g, reg
