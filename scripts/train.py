@@ -270,13 +270,7 @@ def train_step(
 
         # KL / TCC
         "loss/kl": jnp.mean(loss_dict["kl"]),
-        "loss/tcc": jnp.mean(loss_dict["tcc"]),
         "weight/kl": loss_dict["kl_weight"],
-        "weight/tcc": loss_dict["tcc_weight"],
-
-        # 门控 & 一致性
-        "loss/reg_gate": loss_dict["reg_gate"], 
-        "loss/consistency": jnp.mean(loss_dict["consistency"]),
 
         # 优化器监控
         "opt/grad_norm": optax.global_norm(grads),

@@ -267,13 +267,9 @@ class Pi0(_model.BaseModel):
         self.post_head  = _extra_process.GaussianHead(self.vae_hidden_dim, config.latent_dim, rngs=rngs)  # q(z|ctx)
         self.prior_head = _extra_process.GaussianHead(self.vae_hidden_dim, config.latent_dim, rngs=rngs)  # p(z|his_e)
         self.decoder = _extra_process.GaussianDecoderResidual(self.vae_hidden_dim, config.latent_dim, config.action_dim, rngs=rngs)
-        self.drop_rate = 0.1
         
-        # 
         self.cond_emd = _extra_process.CondEmbed(latent_dim=config.latent_dim, action_dim=config.action_dim, emb_dim=2 * action_expert_config.width, num_cond_tokens=1, drop_p=0.2, rngs=rngs)
-        self.cross_gate = _extra_process.CrossGate(embed_dim=self.vae_hidden_dim, mode="global", hidden_mult=0.5, drop_rate=0.1, temp=1.0, sparsity=1e-3, rngs=rngs,)
-        self.consistency_prob = 0.3
-        self.consistency_lambda = 0.01
+
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
@@ -422,8 +418,6 @@ class Pi0(_model.BaseModel):
         observation = _model.preprocess_observation(None, observation, train=False)
         rng, eps_z_rng, eps_pad_rng, time_rng, eps_noise_rng, eps_noise_pad_rng, drop_rng, cond_rng = jax.random.split(rng, 8)
 
-        drop_flag = (jax.random.uniform(drop_rng, ()) < self.drop_rate)
-
         # ---- 数据 & mask ----
         human_action_data = human_action["data"]                    # [B, Th, D]
         his_state_data    = his_state["data"]                       # [B, Ts, D]
@@ -437,9 +431,6 @@ class Pi0(_model.BaseModel):
 
         human_mask = human_mask.astype(bool)
         his_mask   = his_mask.astype(bool)
-        has_human_batch = jnp.any(human_mask)
-        # 训练时有一定概率丢弃 human
-        use_human = jnp.logical_and(has_human_batch, jnp.logical_not(drop_flag))
 
         # ---- 编码到 E ----
         human_state_emd = self.state_enc(human_action_data, human_mask, pos_start=0, deterministic=not train)  # [B, Th, E]
@@ -450,50 +441,22 @@ class Pi0(_model.BaseModel):
         q_pos_start = jnp.clip(q_pos_idx, 0, 1000)
         # jax.debug.print("q_pos_start = {x}", x=q_pos_start.shape)
         # ---- Cross-Attention：Q=his_e, KV=human_e ----
-        def build_ctx_with_human(_):
-            ctx, attn = self.cross_enc(his_state_emd, human_state_emd, kv_mask=human_mask, q_mask=his_mask,
+        
+        ctx, attn = self.cross_enc(his_state_emd, human_state_emd, kv_mask=human_mask, q_mask=his_mask,
                                     q_pos_start=q_pos_start, kv_pos_start=0, deterministic=not train)                 # ctx:[B, Ts, E]
            
-            ctx_gated, g, reg_gate = self.cross_gate(
-                his_e=his_state_emd, human_e=human_state_emd,
-                his_mask=his_mask, human_mask=human_mask,
-                base_ctx=his_state_emd, cross_ctx=ctx,
-                rngs=nnx.Rngs(dropout=drop_rng), train=train
-            )
-            return ctx_gated, attn, g, reg_gate
-        
-        def build_ctx_without_human(_):
-            dummy_attn = jnp.zeros((his_state_emd.shape[0], 4, his_state_emd.shape[1], human_state_emd.shape[1]))
-            g = jnp.zeros((his_state_emd.shape[0], 1, 1), dtype=his_state_emd.dtype)
-            reg_gate = jnp.array(0.0, dtype=his_state_emd.dtype)  
-            return his_state_emd, dummy_attn, g, reg_gate
-        
-        ctx, attn, gate_g, reg_gate = jax.lax.cond(use_human, build_ctx_with_human, build_ctx_without_human, operand=None)
-
         # 对齐 action_horizon
         ah = actions.shape[1]
         Ts = ctx.shape[1]
         assert Ts == ah, f"CrossEncoder 输出长度 Ts={Ts} 必须与 action_horizon ah={ah} 对齐。"
 
         # ---- VAE: q(z|ctx), p(z|his_e) ----
-        # mu_z, logvar_z = self.post_head(ctx)        # [B, ah, Z]
-        mu_p, logvar_p = self.prior_head(his_state_emd)  # [B, ah, Z]  # his_e 与 ctx 等长（Ts==ah）
-        def post_head_on(_):  return self.post_head(ctx)
-        def post_head_off(_): return (jnp.zeros_like(mu_p), jnp.zeros_like(logvar_p))
-        mu_z, logvar_z = jax.lax.cond(use_human, post_head_on, post_head_off, operand=None)  # [B, ah, Z]
-        
-        beta_small = (kl_weight <= 1e-5)
-        use_prior_z = jnp.logical_or(beta_small,jnp.logical_not(use_human))
-        
-        def sample_prior(_):
-            eps = jax.random.normal(eps_z_rng, mu_p.shape, dtype=mu_p.dtype)
-            return mu_p + jnp.exp(0.5 * logvar_p) * eps
+        mu_z, logvar_z = self.post_head(ctx)
+        mu_p, logvar_p = jnp.zeros_like(mu_z), jnp.zeros_like(logvar_z)
 
-        def sample_posterior(_):
-            eps = jax.random.normal(eps_z_rng, mu_z.shape, dtype=mu_z.dtype)
-            return mu_z + jnp.exp(0.5 * logvar_z) * eps
-
-        z = jax.lax.cond(use_prior_z, sample_prior, sample_posterior, operand=None)  # [B, ah, Z]
+    
+        eps = jax.random.normal(eps_z_rng, mu_z.shape, dtype=mu_z.dtype)
+        z = mu_z + jnp.exp(0.5 * logvar_z) * eps
 
         mask_f = his_mask.astype(mu_z.dtype)[..., None]  # [B,ah,1]
         z = mask_f * z + (1 - mask_f) * jax.random.normal(eps_pad_rng, z.shape, dtype=z.dtype)
@@ -517,7 +480,6 @@ class Pi0(_model.BaseModel):
         # ---- conditional embedding tokens ----
         cond_tokens, cond_mask = self.cond_emd(z, mu_noise, logvar_noise, rngs=cond_rng, train=train)  # [B, 1, E]
 
-        # ---- LLM 前向（保持你原逻辑）----
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)               # [B,P,*]
         
         new_prefix_tokens = jnp.concatenate([cond_tokens, prefix_tokens], axis=1)  # [B,P+ah+1,*]
@@ -548,62 +510,13 @@ class Pi0(_model.BaseModel):
         step_mask = mask_f.squeeze(-1).astype(mse_step.dtype)
         mse_step = (mse_step * step_mask) / (jnp.sum(step_mask, axis=1, keepdims=True) + 1e-8)
         
-        def _with_human_step(_):
-            kl_step = _extra_process.kl_balanced_with_freebits(
-                mu_z, logvar_z, mu_p, logvar_p,
-                mask=his_mask, alpha=0.8, free_bits=0.5, reduce="none"  # [B, ah]
-            )
-            tcc_val = _extra_process.tcc_cycle_back_regression(
-                his_state_emd, human_state_emd, mask_u=his_mask, mask_v=human_mask,
-                tau=getattr(self, "tcc_tau", 0.1),
-                lambda_logvar=getattr(self, "tcc_lambda_logvar", 1e-3)   # 标量
-            )
-            tcc_step = jnp.full_like(mse_step, tcc_val)  # 广播到 [B, ah]
-            return kl_step, tcc_step
-
-        def _without_human_step(_):
-            zeros = jnp.zeros_like(mse_step)  # [B, ah]
-            return zeros, zeros
-
-        kl_step, tcc_step = jax.lax.cond(use_human, _with_human_step, _without_human_step, operand=None)
-        
-        def do_consistency(_):
-            # g=0 / 无 human 路径：ctx0=his_state_emd，z0 用 prior，cond0 基于 (z0, mu0, logvar0)
-            eps_z0 = jax.random.normal(eps_z_rng, mu_p.shape, dtype=mu_p.dtype)  # 共享 rng 以降方差（简化）
-            z0 = mu_p + jnp.exp(0.5 * logvar_p) * eps_z0
-            mu0, logv0 = self.decoder(his_state_emd, z0)
-
-            # 用“相同的 x_t（主分支的）”做 suffix，保证比较同一点的速度场
-            cond0, mask0 = self.cond_emd(z0, mu0, logv0, rngs=cond_rng, train=train)
-
-            new_pref_tok0  = jnp.concatenate([cond0, prefix_tokens], axis=1)
-            new_pref_mask0 = jnp.concatenate([mask0,  prefix_mask],  axis=1)
-            new_pref_ar0   = jnp.concatenate([jnp.zeros((1, )), prefix_ar_mask], axis=0)
-
-            in_mask0 = jnp.concatenate([new_pref_mask0, suffix_mask], axis=1)
-            ar_mask0 = jnp.concatenate([new_pref_ar0,   suffix_ar_mask], axis=0)
-            attn0    = make_attn_mask(in_mask0, ar_mask0)
-            pos0     = jnp.cumsum(in_mask0.astype(jnp.int32), axis=1) - 1
-
-            (_, suffix_out0), _ = self.PaliGemma.llm(
-                [new_pref_tok0, suffix_tokens],  # suffix_tokens 复用主分支（同 x_t, t）
-                mask=attn0,
-                positions=pos0,
-            )
-            v_t0 = self.action_out_proj(suffix_out0[:, -self.action_horizon:])  # [B,ah,D]
-
-            # 一致性损失：按 (1 - g) 加权（g 大时少约束，g 小时逼近 no-human）
-            w_cons = (1.0 - gate_g).astype(v_t.dtype)            # [B,1,1]
-            w_cons = jnp.broadcast_to(w_cons, v_t.shape)         # [B,ah,D]
-            cons = jnp.mean(((v_t - v_t0) ** 2) * w_cons, axis=-1)  # [B,ah]
-            cons = (cons * step_mask) / (jnp.sum(step_mask, axis=1, keepdims=True) + 1e-8)
-            return cons
-        
-        do_cons = train & (jax.random.uniform(drop_rng, ()) < self.consistency_prob)
-        cons_step = jax.lax.cond(do_cons, do_consistency, lambda _: jnp.zeros_like(mse_step), operand=None)
-
-        loss_step = mse_step + kl_weight * kl_step + tcc_weight * tcc_step + reg_gate +  self.consistency_lambda * cons_step
-        return {"total": loss_step, "kl": kl_step, "tcc": tcc_step, "kl_weight": kl_weight, "tcc_weight": tcc_weight, "reg_gate": reg_gate, "consistency": cons_step}  # [B, ah]
+        kl_step = _extra_process.kl_balanced_with_freebits(
+            mu_z, logvar_z, mu_p, logvar_p,
+            mask=his_mask, alpha=0.8, free_bits=0.5, reduce="none"  # [B, ah]
+        )
+           
+        loss_step = mse_step + kl_weight * kl_step
+        return {"total": loss_step, "kl": kl_step, "kl_weight": kl_weight}  # [B, ah]
 
     @override
     def sample_actions(
