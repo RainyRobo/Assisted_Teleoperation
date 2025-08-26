@@ -219,7 +219,8 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                     {
                         "images": {"cam_high": "observation.images.top"},
                         "state": "observation.state",
-                        "actions": "action",
+                        "actions": "action"
+                        # 新增 aloha_sim config
                     }
                 )
             ]
@@ -231,9 +232,12 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
+            # complete aloha inputs by ly 2024-06
             inputs=[aloha_policy.AlohaInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
+
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
         )
+        # TODO 增加ep_state的delta转换
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(
@@ -832,6 +836,10 @@ _CONFIGS = [
                             },
                             "state": "observation.state",
                             "actions": "action",
+                            # 新增
+                            "ep_state": "episode_state", 
+                            # "ep_mask": "episode_mask", 
+                            "ep_length": "episode_len"
                         }
                     )
                 ]

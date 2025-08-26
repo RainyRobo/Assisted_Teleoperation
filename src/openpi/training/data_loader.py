@@ -178,6 +178,23 @@ class LerobotDataset_HandR(lerobot_dataset.LeRobotDataset):
         if self.pad_episode and self.max_episode_len is None:
             raise ValueError("pad_episode=True 时必须提供 max_episode_len。")
         
+    def __getitem__(self, idx: SupportsIndex) -> dict:
+        item = super().__getitem__(idx)
+        ep_idx = item["episode_index"].item()  # 当前样本所属的 episode 索引
+        ep_states = self._get_episode_states(ep_idx)    # (L, state_dim)
+
+        if self.pad_episode:
+            # 若开启定长模式，则 pad 到 (T, D)，并返回 mask（True=有效，False=pad）
+            ep_states_pad, ep_mask = self._pad_episode(ep_states, self.max_episode_len)  # (T,D),(T,)
+            item["episode_state"] = ep_states_pad       # 写入定长序列
+            item["episode_mask"]  = ep_mask             # 写入掩码
+            item["episode_len"]   = torch.tensor([int(ep_mask.sum().item())], dtype=torch.long)
+        else:
+            item["episode_state"] = ep_states           # (L, D)
+            item["episode_len"]   = torch.tensor([ep_states.shape[0]], dtype=torch.long)
+
+        return item 
+    
     def _get_episode_states(self, ep_idx: int) -> torch.Tensor:
         """获取并返回指定 episode 的整段 state 序列 (L, state_dim) 或 (T, state_dim, 若启用 pad)"""
         # 1) 先尝试从缓存中获取
@@ -220,33 +237,6 @@ class LerobotDataset_HandR(lerobot_dataset.LeRobotDataset):
         self._episode_state_cache.clear()
 
 
-    def __getitem__(self, idx: SupportsIndex) -> dict:
-        item = super().__getitem__(idx)
-        ep_idx = item["episode_index"].item()  # 当前样本所属的 episode 索引
-        # print(ep_idx)
-
-        # 获取并附加整段 episode 的 state 序列
-        ep_states = self._get_episode_states(ep_idx)    # (L, state_dim)
-
-        # print(ep_states.shape)
-        # print(ep_states)
-        # print("------------")
-
-        if self.pad_episode:
-            # 若开启定长模式，则 pad 到 (T, D)，并返回 mask（True=有效，False=pad）
-            ep_states_pad, ep_mask = self._pad_episode(ep_states, self.max_episode_len)  # (T,D),(T,)
-            item["episode_state"] = ep_states_pad       # 写入定长序列
-            item["episode_mask"]  = ep_mask             # 写入掩码
-            item["episode_len"]   = torch.tensor([int(ep_mask.sum().item())], dtype=torch.long)
-        else:
-            item["episode_state"] = ep_states           # (L, D)
-            item["episode_len"]   = torch.tensor([ep_states.shape[0]], dtype=torch.long)
-
-        # print("\n====================\n item:" , item.keys())
-        
-        return item 
-
-
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -268,8 +258,9 @@ def create_torch_dataset(
         cache_episode_state=True
     )
 
+
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)]) 
 
     return dataset
 
@@ -305,7 +296,9 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     return TransformedDataset(
         dataset,
         [
+            # repackage
             *data_config.repack_transforms.inputs,
+            # data transforms
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
@@ -408,8 +401,13 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
+
+    # 获取原始
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+
+    # 应用数据变换 adapt to pi-0
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    # print("transform_dataset", dataset[0].keys())
 
     data_loader = TorchDataLoader(
         dataset,
@@ -612,4 +610,4 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            yield _model.Observation.from_dict(batch), batch["actions"], batch["ep_state"]

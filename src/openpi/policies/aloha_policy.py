@@ -43,10 +43,16 @@ class AlohaInputs(transforms.DataTransformFn):
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
 
     def __call__(self, data: dict) -> dict:
+        # Decode the aloha data format.
         data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
 
         # Get the state. We are padding from 14 to the model action dim.
         state = transforms.pad_to_dim(data["state"], self.action_dim)
+        # episoid state padding from 14 to the model action dim (32)
+        ep_state = transforms.pad_to_dim(data["ep_state"], self.action_dim)
+
+        # print("ep_state shape in aloha_inputs:", ep_state.shape)
+        # print("state:", state.shape)
 
         in_images = data["images"]
         if set(in_images) - set(self.EXPECTED_CAMERAS):
@@ -80,6 +86,7 @@ class AlohaInputs(transforms.DataTransformFn):
             "image": images,
             "image_mask": image_masks,
             "state": state,
+            "ep_state": ep_state
         }
 
         # Actions are only available during training.
@@ -90,6 +97,7 @@ class AlohaInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
 
         return inputs
 
@@ -167,6 +175,9 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
     state = np.asarray(data["state"])
     state = _decode_state(state, adapt_to_pi=adapt_to_pi)
 
+    ep_state = _decode_muti_state(data["ep_state"], adapt_to_pi=adapt_to_pi)
+    # print("ep_state shape:", ep_state.shape)
+
     def convert_image(img):
         img = np.asarray(img)
         # Convert to uint8 if using float images.
@@ -180,15 +191,40 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
 
     data["images"] = images_dict
     data["state"] = state
+    data["ep_state"] = ep_state
+
     return data
 
 
 def _decode_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
+    
     if adapt_to_pi:
         # Flip the joints.
         state = _joint_flip_mask() * state
         # Reverse the gripper transformation that is being applied by the Aloha runtime.
         state[[6, 13]] = _gripper_to_angular(state[[6, 13]])
+    return state
+
+# 修改适用于 ep_state
+def _decode_muti_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
+    """
+    state 可以是 [14] 单帧，也可以是 [T, 14] 序列。
+    返回 shape 不变，只做关节翻转和 gripper 角度还原。
+    """
+    state = np.asarray(state)
+
+    if adapt_to_pi:
+        flip = _joint_flip_mask()  # shape (14,)
+        state = state * flip       # 广播：单帧(14,) 或 多帧(T,14) 都能用
+
+        # gripper 通道 [6,13] 单独处理
+        if state.ndim == 1:  # 单帧
+            state[[6, 13]] = _gripper_to_angular(state[[6, 13]])
+        elif state.ndim == 2:  # 多帧序列
+            state[:, [6, 13]] = _gripper_to_angular(state[:, [6, 13]])
+        else:
+            raise ValueError(f"Unsupported state ndim={state.ndim}")
+
     return state
 
 

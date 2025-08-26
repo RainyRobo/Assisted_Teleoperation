@@ -126,13 +126,19 @@ class Normalize(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         if self.norm_stats is None:
             return data
+    
+        ns = dict(self.norm_stats)
+        # 只有当数据里存在对应结构时，才补齐嵌套 stats 形状
+        if "state" in ns:
+            ns["ep_state"] = ns["state"]
 
-        return apply_tree(
+        applied =  apply_tree(
             data,
-            self.norm_stats,
+            ns,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
+        return applied
 
     def _normalize(self, x, stats: NormStats):
         return (x - stats.mean) / (stats.std + 1e-6)
