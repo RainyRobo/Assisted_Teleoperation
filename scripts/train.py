@@ -191,7 +191,7 @@ def train_step(
     model.train()
     
     step_scalar = jnp.array(state.step, dtype=jnp.float32)
-    beta_kl = cosine_warmup(step_scalar, 2_000, 1e-3)    # KL 权重
+    beta_kl = cosine_warmup(step_scalar, 2_000, 1.0)    # KL 权重
     w_tcc_raw = cosine_warmup(step_scalar, 2_000, 1e-3)  # TCC 权重
     w_tcc = jnp.clip(w_tcc_raw, 0., None)
     
@@ -270,17 +270,20 @@ def train_step(
 
         # KL / TCC
         "loss/kl": jnp.mean(loss_dict["kl"]),
-        "loss/tcc": jnp.mean(loss_dict["tcc"]),
         "weight/kl": loss_dict["kl_weight"],
-        "weight/tcc": loss_dict["tcc_weight"],
 
         # 门控 & 一致性
         "loss/reg_gate": loss_dict["reg_gate"], 
-        "loss/consistency": jnp.mean(loss_dict["consistency"]),
 
         # 优化器监控
         "opt/grad_norm": optax.global_norm(grads),
         "opt/param_norm": optax.global_norm(kernel_params),
+        
+        "z/logvar_min": loss_dict["z/logvar_min"],
+        "z/logvar_max": loss_dict["z/logvar_max"],
+        "p/logvar_min": loss_dict["p/logvar_min"],
+        "p/logvar_max": loss_dict["p/logvar_max"],
+        "g/mean": loss_dict["g/mean"],
     }
 
     return new_state, info

@@ -142,7 +142,7 @@ def kl_per_dim_diag_gauss(mu_q, logvar_q, mu_p, logvar_p):
 
 def kl_balanced_with_freebits(
     mu_z, logvar_z, mu_p, logvar_p, mask,
-    alpha=0.8, free_bits=0.5, reduce="mean", eps=1e-8
+    alpha=0.8, free_bits=0.2, reduce="mean", eps=1e-8
 ):
     # 1) 两个方向
     kl_q_p = kl_per_dim_diag_gauss(mu_z, logvar_z, jax.lax.stop_gradient(mu_p), jax.lax.stop_gradient(logvar_p))
@@ -406,6 +406,8 @@ class CrossEncoder(nnx.Module):
 
         return ctx, attn
 
+def safe_logvar(raw, logvar_min=-6.0):        # -6 比 -10 更常见，方差≈0.0025
+    return jnp.log(jax.nn.softplus(raw)) + logvar_min
 
 # -------------------------
 # 潜变量头 & 解码器
@@ -423,7 +425,8 @@ class GaussianHead(nnx.Module):
         h = jax.nn.gelu(self.fc1(x))
         h = jax.nn.gelu(self.fc2(h))
         mu = self.mu_head(h)
-        logvar = jnp.clip(self.lv_head(h), -10.0, 5.0)  # 数值稳定
+        # logvar = jnp.clip(self.lv_head(h), -10.0, 5.0)  # 数值稳定
+        logvar = safe_logvar(self.lv_head(h))
         return mu, logvar
 
 class GaussianDecoderMLP(nnx.Module):
@@ -441,7 +444,8 @@ class GaussianDecoderMLP(nnx.Module):
         h = jax.nn.gelu(self.fc1(x))
         h = jax.nn.gelu(self.fc2(h))
         mu = self.mu_head(h)
-        logvar = jnp.clip(self.lv_head(h), -10.0, 5.0)
+        # logvar = jnp.clip(self.lv_head(h), -10.0, 5.0)
+        logvar = safe_logvar(self.lv_head(h))
         return mu, logvar
 
 class GaussianDecoderResidual(nnx.Module):
@@ -474,7 +478,8 @@ class GaussianDecoderResidual(nnx.Module):
         logvar_base = self.lv_ctx(hc_mod)
         mu          = mu_base + self.mu_res(hz)
         logvar      = logvar_base + self.lv_res(hz)
-        logvar = jnp.clip(logvar, -10.0, 5.0)  # 或 softplus 参数化
+        # logvar = jnp.clip(logvar, -10.0, 5.0)  # 或 softplus 参数化
+        logvar = safe_logvar(logvar)
         return mu, logvar
 
 class CondEmbed(nnx.Module):
@@ -519,7 +524,46 @@ class CondEmbed(nnx.Module):
 
         cond_mask = jnp.ones((B, self.num_cond_tokens), dtype=bool)
         return cond_tokens, cond_mask
-    
+
+class CondEmbedRNN(nnx.Module):
+    def __init__(self, *, latent_dim, action_dim, emd_dim, num_cond_tokens=2, rnn_hidden=512, bidir=True, drop_p=0.1, rngs=None):
+        super().__init__()
+        self.bidir = bidir
+        self.num_cond_tokens = num_cond_tokens
+        self.in_dim = latent_dim + 2*action_dim
+        self.emb_dim = emd_dim
+        self.rnn_hidden = rnn_hidden
+        self.proj_in = nnx.Linear(self.in_dim, rnn_hidden, rngs=rngs)
+        self.gru_f = nnx.GRUCell(rnn_hidden, rnn_hidden, rngs=rngs)
+        self.gru_b = nnx.GRUCell(rnn_hidden, rnn_hidden, rngs=rngs) if bidir else None
+        self.ln = nnx.LayerNorm(rnn_hidden * (2 if bidir else 1), rngs=rngs)
+        self.fc1 = nnx.Linear(rnn_hidden * (2 if bidir else 1), emd_dim, rngs=rngs)
+        self.fc2 = nnx.Linear(emd_dim, num_cond_tokens * emd_dim, rngs=rngs)
+        self.drop = nnx.Dropout(rate=drop_p, rngs=rngs)
+
+    def __call__(self, z, mu_noise, logvar_noise, *, rngs: nnx.Rngs, train: bool):
+        B, T, _ = z.shape
+        h_f = jnp.zeros((B, self.rnn_hidden))
+        h_b = jnp.zeros((B, self.rnn_hidden)) if self.bidir else None
+
+        feat = jnp.concatenate([z, mu_noise, logvar_noise], axis=-1)  # [B, ah, F]
+        x = self.proj_in(feat)  # [B, T, H]
+
+        for t in range(T):
+            h_f, _ = self.gru_f(x[:, t, :], h_f)
+        if self.bidir:
+            for t in reversed(range(T)):
+                h_b, _ = self.gru_b(x[:, t, :], h_b)
+        h = jnp.concatenate([h_f, h_b], axis=-1) if self.bidir else h_f
+        h = self.ln(h)
+        h = jax.nn.relu(self.fc1(h))                                # [B, E]
+
+        if train:
+            h = self.drop(h, rngs=nnx.Rngs(dropout=rngs), deterministic=not train)
+        cond = self.fc2(h).reshape(B, self.num_cond_tokens, self.emb_dim)      # [B,K,E]
+        cond_mask = jnp.ones((B, self.num_cond_tokens), dtype=bool)
+        return cond, cond_mask
+
 from typing import Literal, Tuple, Optional
 
 def masked_mean(x: jnp.ndarray, m: jnp.ndarray) -> jnp.ndarray:
