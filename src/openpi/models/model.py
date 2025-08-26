@@ -34,8 +34,8 @@ class ModelType(enum.Enum):
 IMAGE_KEYS = (
     "base_0_rgb",
     # "left_wrist_0_rgb",
-    "right_wrist_0_rgb",
-    "low_0_rgb"
+    # "right_wrist_0_rgb",
+    # "low_0_rgb"
 )
 
 
@@ -272,12 +272,12 @@ class BaseModel(nnx.Module, abc.ABC):
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
     
-    @abc.abstractmethod
-    def sample_actions_rtc(self, rng: at.KeyArrayLike, observation: Observation, prefix_actions: jax.Array,
-        inference_delay: int,
-        prefix_attention_horizon: int,
-        prefix_attention_schedule,
-        max_guidance_weight: float) -> Actions: ...
+    # @abc.abstractmethod
+    # def sample_actions_rtc(self, rng: at.KeyArrayLike, observation: Observation, prefix_actions: jax.Array,
+    #     inference_delay: int,
+    #     prefix_attention_horizon: int,
+    #     prefix_attention_schedule,
+    #     max_guidance_weight: float) -> Actions: ...
     
 
 

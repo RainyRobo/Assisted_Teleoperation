@@ -125,6 +125,127 @@ class FakeDataset(Dataset):
     def __len__(self) -> int:
         return self._num_samples
 
+# 新增
+from typing import Optional, Tuple, Dict, List
+
+class LerobotDataset_HandR(lerobot_dataset.LeRobotDataset):
+    """
+    继承自第三方 LeRobotDataset，不改其源码。
+    仅在 __getitem__ 中附加:
+      - item["episode_state"] : (L, state_dim) 或 (T, state_dim, 若启用 pad)
+      - item["episode_mask"]  : (T,)  (仅当 pad_episode=True 时返回)
+      - item["episode_len"]   : (1,)  原始长度
+    """
+    def __init__(
+        self,
+        # ↓↓↓ 完整复刻父类签名（保持一致，便于 IDE 补全、静态检查）
+        repo_id: str,
+        root: str | None = None,
+        episodes: List[int] | None = None,
+        image_transforms=None,
+        delta_timestamps: Dict[str, List[float]] | None = None,
+        tolerance_s: float = 1e-4,
+        revision: str | None = None,
+        force_cache_sync: bool = False,
+        download_videos: bool = True,
+        video_backend: str | None = None,
+        *,
+        # ↓↓↓ 新增仅属于子类的功能开关（做成关键字参数，默认关闭，保持向后兼容）
+        pad_episode: bool = False,                 # 是否把整段 episode 的 state pad 到固定长度
+        max_episode_len: Optional[int] = None,     # pad 的目标长度，pad_episode=True 时必填
+        cache_episode_state: bool = True,          # 是否缓存每个 episode 的整段 state，加速重复访问
+    ):
+        # 调用父类构造，初始化第三方数据集的全部既有逻辑与资源
+        super().__init__(
+            repo_id=repo_id,
+            root=root,
+            episodes=episodes,
+            image_transforms=image_transforms,
+            delta_timestamps=delta_timestamps,
+            tolerance_s=tolerance_s,
+            revision=revision,
+            force_cache_sync=force_cache_sync,
+            download_videos=download_videos,
+            video_backend=video_backend,
+        )
+        # 保存子类配置（不影响父类行为）
+        self.pad_episode = pad_episode            # 记录是否需要定长 padding
+        self.max_episode_len = max_episode_len    # 记录固定长度 T
+        self.cache_episode_state = cache_episode_state  # 记录是否启用缓存
+        self._episode_state_cache: Dict[int, torch.Tensor] = {}  # ep_idx -> (L, D) 的缓存字典
+
+        # 参数校验：需要 pad 时，必须给出目标长度
+        if self.pad_episode and self.max_episode_len is None:
+            raise ValueError("pad_episode=True 时必须提供 max_episode_len。")
+        
+    def _get_episode_states(self, ep_idx: int) -> torch.Tensor:
+        """获取并返回指定 episode 的整段 state 序列 (L, state_dim) 或 (T, state_dim, 若启用 pad)"""
+        # 1) 先尝试从缓存中获取
+        if self.cache_episode_state and ep_idx in self._episode_state_cache:
+            return self._episode_state_cache[ep_idx]
+
+        # 2) 计算该 episode 的全局帧索引范围（半开区间 [from, to)）
+        ep_start = int(self.episode_data_index["from"][ep_idx])
+        ep_end   = int(self.episode_data_index["to"][ep_idx])
+        ep_indices = list(range(ep_start, ep_end))
+
+        # 通过 HF Dataset.select 子集化，再取列并 stack 成 (L, D)
+        ep_states = torch.stack(self.hf_dataset.select(ep_indices)["observation.state"])  # (L, state_dim)
+        
+        # 4) 写入缓存（如启用）
+        if self.cache_episode_state:
+            self._episode_state_cache[ep_idx] = ep_states
+
+        return ep_states
+    
+    @staticmethod
+    def _pad_episode(x: torch.Tensor, T: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        L = x.shape[0]                                             # 原始长度
+        if L == T:
+            # 刚好等长：直接返回与全 1 掩码
+            return x, torch.ones(T, dtype=torch.bool)
+        if L > T:
+            # 超过：裁剪到 T（训练/部署常见做法）
+            return x[:T], torch.ones(T, dtype=torch.bool)
+        # 不足：尾部补零（保持数值稳定），并构造 mask
+        pad_len = T - L
+        x_pad = F.pad(x, (0, 0, 0, pad_len))                       # 在时间维后补零 → (T, D)
+        mask  = torch.cat(
+            [torch.ones(L, dtype=torch.bool), torch.zeros(pad_len, dtype=torch.bool)],
+            dim=0
+        )                                                          # True=有效，False=pad
+        return x_pad, mask
+    
+    def clear_episode_state_cache(self) -> None:
+        self._episode_state_cache.clear()
+
+
+    def __getitem__(self, idx: SupportsIndex) -> dict:
+        item = super().__getitem__(idx)
+        ep_idx = item["episode_index"].item()  # 当前样本所属的 episode 索引
+        # print(ep_idx)
+
+        # 获取并附加整段 episode 的 state 序列
+        ep_states = self._get_episode_states(ep_idx)    # (L, state_dim)
+
+        # print(ep_states.shape)
+        # print(ep_states)
+        # print("------------")
+
+        if self.pad_episode:
+            # 若开启定长模式，则 pad 到 (T, D)，并返回 mask（True=有效，False=pad）
+            ep_states_pad, ep_mask = self._pad_episode(ep_states, self.max_episode_len)  # (T,D),(T,)
+            item["episode_state"] = ep_states_pad       # 写入定长序列
+            item["episode_mask"]  = ep_mask             # 写入掩码
+            item["episode_len"]   = torch.tensor([int(ep_mask.sum().item())], dtype=torch.long)
+        else:
+            item["episode_state"] = ep_states           # (L, D)
+            item["episode_len"]   = torch.tensor([ep_states.shape[0]], dtype=torch.long)
+
+        # print("\n====================\n item:" , item.keys())
+        
+        return item 
+
 
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
@@ -137,11 +258,14 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
+    dataset = LerobotDataset_HandR(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        pad_episode=False,
+        max_episode_len=None,
+        cache_episode_state=True
     )
 
     if data_config.prompt_from_task:

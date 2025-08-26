@@ -49,6 +49,15 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
+    
+    # @override
+    # def infer_guide(self, obs, prev_action_chunk, inference_delay, prefix_attention_horizon, prefix_attention_schedule, max_guidance_weight):
+    #     return super().infer_guide(obs, prev_action_chunk, inference_delay, prefix_attention_horizon, prefix_attention_schedule, max_guidance_weight)
+    
+    # @override
+    # def infer_realtime(self, obs, prev_action_chunk, inference_delay, prefix_attention_horizon, prefix_attention_schedule, max_guidance_weight):
+    #     return super().infer_realtime(obs, prev_action_chunk, inference_delay, prefix_attention_horizon, prefix_attention_schedule, max_guidance_weight)
+    
 
     @override
     def reset(self) -> None:

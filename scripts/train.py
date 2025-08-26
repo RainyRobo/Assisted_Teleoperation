@@ -199,19 +199,19 @@ def train_step(
     }
     return new_state, info
 
-def eval_step(
-    config: _config.TrainConfig,
-    state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
-) -> dict[str, at.Array]:
-    eval_params = state.ema_params if state.ema_params is not None else state.params
-    model = nnx.merge(state.model_def, eval_params)
-    model.eval()
+# def eval_step(
+#     config: _config.TrainConfig,
+#     state: training_utils.TrainState,
+#     batch: tuple[_model.Observation, _model.Actions],
+# ) -> dict[str, at.Array]:
+#     eval_params = state.ema_params if state.ema_params is not None else state.params
+#     model = nnx.merge(state.model_def, eval_params)
+#     model.eval()
 
-    observation, actions = batch
-    # loss = model.compute_loss(None, observation, actions)  # 如果内部会按 eval 路径
-    val_chunked = model.compute_HumAction_loss(None, observation, actions, train=False)
-    return {"val_loss": jnp.mean(val_chunked)}
+#     observation, actions = batch
+#     # loss = model.compute_loss(None, observation, actions)  # 如果内部会按 eval 路径
+#     val_chunked = model.compute_HumAction_loss(None, observation, actions, train=False)
+#     return {"val_loss": jnp.mean(val_chunked)}
 
 
 def main(config: _config.TrainConfig):
