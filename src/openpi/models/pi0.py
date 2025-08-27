@@ -220,9 +220,9 @@ class Pi0(_model.BaseModel):
         
         # 3. 新增 embed human episode state
         if obs.ep_state is not None:
-            # state_token = self.state_proj(obs.state)[:, None, :] # [b,s] -> [b, 1, s:32] -> [b,1,e]
-            ep_state_tokens = self.state_proj(obs.ep_state)
-            # jax.debug.print("ep_state_tokens: {}", ep_state_tokens.shape)
+            # 截断到 200 帧
+            ep_state = obs.ep_state[:, :200, :]
+            ep_state_tokens = self.state_proj(ep_state)
 
             ep_state_tokens = self.state_to_ep_state_emb(ep_state_tokens)
             tokens.append(ep_state_tokens)

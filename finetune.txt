@@ -4,7 +4,7 @@ export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
 
 uv run scripts/compute_norm_stats.py --config-name pi0_aloha_sim_transfer_cube
 
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_aloha_sim_transfer_cube --exp-name=human_slohasim_0827 --overwrite
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_aloha_sim_transfer_cube --exp-name=human_mask200_0828 --overwrite
 
 
 ##inference##
