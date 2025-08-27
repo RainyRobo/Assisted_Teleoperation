@@ -148,13 +148,14 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, 
         rng: at.KeyArrayLike,
-        observation: _model.Observation, #
+        observation: _model.Observation, 
         actions: _model.Actions
     ):
         # original loss
         # chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         
         # human assistance loss
+
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
     

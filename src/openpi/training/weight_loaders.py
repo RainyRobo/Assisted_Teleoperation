@@ -51,8 +51,10 @@ class CheckpointWeightLoader(WeightLoader):
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
         # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 
+        # TODO ".*(lora|human_action_emd|state_emd|cross_pool|gauss).*")
+        # return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        return _merge_params(loaded_params, params, missing_regex = ".*(lora|state_to_ep_state_emb).*")
 
 @dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
@@ -77,14 +79,16 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     """Merges the loaded parameters with the reference parameters.
 
     Args:
-        loaded_params: The parameters to merge.
-        params: The reference parameters.
+        loaded_params: The parameters to merge. (checkpoints)
+        params: The reference parameters. (模型所需参数)
         missing_regex: A regex pattern for all missing keys that should be merged from the reference parameters.
 
     Returns:
         A new dictionary with the merged parameters.
     """
+    # 参考参数
     flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+    # load 参数
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
 
     # First, take all weights that are a subset of the reference weights.
