@@ -6,6 +6,7 @@ from openpi_client.runtime import environment as _environment
 from typing_extensions import override
 
 
+
 class AlohaSimEnvironment(_environment.Environment):
     """An environment for an Aloha robot in simulation."""
 
@@ -50,7 +51,17 @@ class AlohaSimEnvironment(_environment.Environment):
         # Convert axis order from [H, W, C] --> [C, H, W]
         img = np.transpose(img, (2, 0, 1))
 
+        # # ep_state = np.random.randn(400, 14).astype(np.float32)
+        # ds = LeRobotDataset("lerobot/aloha_sim_transfer_cube_human")   # 或本地路径
+    
+#     # 获取第 0 集的 states
+#     states = get_episode_states(ds, 0)
+
+
+        # ep_state = np.zeros((400, 14), dtype=np.float32)
+
         return {
             "state": gym_obs["agent_pos"],
             "images": {"cam_high": img},
+            # "ep_state": ep_state
         }

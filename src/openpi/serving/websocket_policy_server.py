@@ -127,6 +127,10 @@ from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+# import get_episoid as _get_episoid
+from openpi.serving import get_episoid as _get_episoid
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +152,7 @@ class WebsocketPolicyServer:
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        self.ds = LeRobotDataset("lerobot/aloha_sim_transfer_cube_human")
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -175,7 +180,8 @@ class WebsocketPolicyServer:
             try:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
-
+                # print("AAAAAAAAA: obs: ", obs.keys())
+                obs["ep_state"] = _get_episoid.get_episode_states(self.ds, episode_index=10).numpy()
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
