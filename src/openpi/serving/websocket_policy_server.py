@@ -180,7 +180,8 @@ class WebsocketPolicyServer:
             try:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
-                # print("AAAAAAAAA: obs: ", obs.keys())
+
+                # TODO : Preset interface, currently used for reading training data.
                 obs["ep_state"] = _get_episoid.get_episode_states(self.ds, episode_index=10).numpy()
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
