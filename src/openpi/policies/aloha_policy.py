@@ -176,8 +176,20 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
     state = _decode_state(state, adapt_to_pi=adapt_to_pi)
 
     ep_state = _decode_muti_state(data["ep_state"], adapt_to_pi=adapt_to_pi)
-    # print("ep_state shape:", ep_state.shape)
 
+    ep_state = add_time_scaled_noise_and_plot(
+    ep_state,
+    noise_ratio=0.1,
+    mode="quadratic",   # 可改 'linear' 或 'exp'
+    exp_k=4.0,
+    min_scale=1e-3,
+    dims=None,          # 只对子集加噪: 例如 np.arange(7)
+    seed=42,
+    joint_idx=0,
+    save_dir="./plots",
+    prefix="demo"
+)
+    
     def convert_image(img):
         img = np.asarray(img)
         # Convert to uint8 if using float images.
@@ -226,6 +238,96 @@ def _decode_muti_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.nd
             raise ValueError(f"Unsupported state ndim={state.ndim}")
 
     return state
+
+
+import matplotlib
+matplotlib.use("Agg")  # 服务器无显示也能保存图
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+def add_time_scaled_noise_and_plot(
+    ep_state: np.ndarray,
+    noise_ratio: float = 0.1,
+    mode: str = "quadratic",        # 'linear' | 'quadratic' | 'exp'
+    exp_k: float = 4.0,              # 指数模式的曲率
+    min_scale: float = 1e-3,         # 防止某维度接近0导致相对噪声为0
+    dims=None,                       # 只对这些维度加噪声；None 表示全部维度
+    seed: int | None = None,
+    joint_idx: int = 0,              # 只绘制/保存的关节维度
+    save_dir: str = "./plots",       # 保存目录
+    prefix: str = "traj"             # 文件名前缀
+):
+    """
+    ep_state: (T, D) 轨迹数组
+    返回: ep_state_noisy, noise, w (时间权重), 保存的两张图路径
+    """
+    assert ep_state.ndim == 2, "ep_state 必须是 (T, D)"
+    T, D = ep_state.shape
+
+    if dims is None:
+        dims = np.arange(D)
+    else:
+        dims = np.asarray(dims)
+        assert dims.ndim == 1 and np.all((0 <= dims) & (dims < D)), "dims 越界"
+
+    rng = np.random.default_rng(seed)
+
+    # 时间权重 w(t) ∈ [0,1]
+    t = np.linspace(0.0, 1.0, T)
+    if mode == "linear":
+        w = t
+    elif mode == "quadratic":
+        w = t**2
+    elif mode == "exp":
+        # 使 w(0)=0, w(1)=1，前期更平缓、后期更陡
+        w = (np.exp(exp_k * t) - 1.0) / (np.exp(exp_k) - 1.0)
+    else:
+        raise ValueError("mode 必须是 'linear' | 'quadratic' | 'exp'")
+    w = w[:, None]  # (T,1) 便于广播
+
+    # 相对比例噪声尺度（保证数值小也有一定比例，但不至于盖过信号）
+    scale = noise_ratio * np.maximum(np.abs(ep_state), min_scale)  # (T,D)
+
+    # 生成噪声，只对指定维度
+    noise = np.zeros_like(ep_state, dtype=ep_state.dtype)
+    noise_block = rng.normal(0.0, 1.0, size=(T, len(dims))).astype(ep_state.dtype)
+    noise_block *= scale[:, dims]
+    noise_block *= w
+    noise[:, dims] = noise_block
+
+    ep_state_noisy = ep_state + noise
+
+    # # ===== 绘图并保存（只画 joint_idx 这一维）=====
+    # Path(save_dir).mkdir(parents=True, exist_ok=True)
+    # x = np.arange(T)
+
+    # # 图1：原始 vs 带噪的轨迹（joint_idx）
+    # fig1 = plt.figure(figsize=(8, 4))
+    # plt.plot(x, ep_state[:, joint_idx], label=f"state[{joint_idx}]")
+    # plt.plot(x, ep_state_noisy[:, joint_idx], label=f"state_noisy[{joint_idx}]")
+    # plt.xlabel("t (0..{})".format(T-1))
+    # plt.ylabel("value")
+    # plt.title(f"Joint {joint_idx}: state vs noisy state ({mode})")
+    # plt.legend()
+    # plt.grid(True)
+    # path1 = str(Path(save_dir) / f"{prefix}_state_vs_noisy_joint{joint_idx}.png")
+    # plt.savefig(path1, dpi=150, bbox_inches="tight")
+    # plt.close(fig1)
+
+    # # 图2：噪声曲线（joint_idx）
+    # fig2 = plt.figure(figsize=(8, 4))
+    # plt.plot(x, noise[:, joint_idx], label=f"noise[{joint_idx}]")
+    # plt.xlabel("t (0..{})".format(T-1))
+    # plt.ylabel("noise")
+    # plt.title(f"Joint {joint_idx}: noise over time ({mode})")
+    # plt.legend()
+    # plt.grid(True)
+    # path2 = str(Path(save_dir) / f"{prefix}_noise_joint{joint_idx}.png")
+    # plt.savefig(path2, dpi=150, bbox_inches="tight")
+    # plt.close(fig2)
+
+    return ep_state_noisy
+
 
 
 def _encode_actions(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
