@@ -175,20 +175,24 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
     state = np.asarray(data["state"])
     state = _decode_state(state, adapt_to_pi=adapt_to_pi)
 
+    # 处理人类引导
     ep_state = _decode_muti_state(data["ep_state"], adapt_to_pi=adapt_to_pi)
 
-    ep_state = add_time_scaled_noise_and_plot(
-    ep_state,
-    noise_ratio=0.1,
-    mode="quadratic",   # 可改 'linear' 或 'exp'
-    exp_k=4.0,
-    min_scale=1e-3,
-    dims=None,          # 只对子集加噪: 例如 np.arange(7)
-    seed=42,
-    joint_idx=0,
-    save_dir="./plots",
-    prefix="demo"
-)
+
+
+#   # ===== 示例：对 ep_state 添加时间加权噪声并绘图 =====
+#     ep_state = add_time_scaled_noise_and_plot(
+#     ep_state,
+#     noise_ratio=0.1,
+#     mode="quadratic",   # 可改 'linear' 或 'exp'
+#     exp_k=4.0,
+#     min_scale=1e-3,
+#     dims=None,          # 只对子集加噪: 例如 np.arange(7)
+#     seed=42,
+#     joint_idx=0,
+#     save_dir="./plots",
+#     prefix="demo"
+# )
     
     def convert_image(img):
         img = np.asarray(img)
