@@ -230,10 +230,10 @@ def data_transform(path, episode_num, save_path):
 
             min_length = min(len(camera_high), len(camera_low), len(camera_left_wrist),len(camera_right_wrist))
             # # print(min_length)
-            fixed_frame_count = 300
-            if min_length < fixed_frame_count:
-                print(f"Episode {i} has only {min_length} frames, less than required {fixed_frame_count}. Skipping.")
-                continue
+            # fixed_frame_count = 300
+            # if min_length < fixed_frame_count:
+            #     print(f"Episode {i} has only {min_length} frames, less than required {fixed_frame_count}. Skipping.")
+            #     continue
 
             camera_high = camera_high[:min_length]
             camera_low = camera_low[:min_length]
@@ -377,4 +377,4 @@ episode_i.hdf5:
             - cam_right_wrist
 '''
 if __name__ == "__main__":
-    data_transform("/data/liuyu/fold_clothes_mcap", 25, "/home/research1/data/fold_clothes_hdf5")
+    data_transform("/data/teleop/DualPiper_Blocks_Pick", 200, "/home/research1/data/pick_from_multi")

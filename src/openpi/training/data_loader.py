@@ -16,6 +16,9 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 import inspect
 T_co = TypeVar("T_co", covariant=True)
+# from waypoint_extraction.extract_waypoints import dp_waypoint_selection, greedy_waypoint_selection, backtrack_waypoint_selection
+from waypoint_extraction.extract_waypoints import dp_waypoint_selection, greedy_waypoint_selection, backtrack_waypoint_selection
+
 
 
 class Dataset(Protocol[T_co]):
@@ -125,7 +128,6 @@ class FakeDataset(Dataset):
     def __len__(self) -> int:
         return self._num_samples
 
-# 新增
 from typing import Optional, Tuple, Dict, List
 
 class LerobotDataset_HandR(lerobot_dataset.LeRobotDataset):
@@ -183,18 +185,48 @@ class LerobotDataset_HandR(lerobot_dataset.LeRobotDataset):
         ep_idx = item["episode_index"].item()  # 当前样本所属的 episode 索引
 
         # 当前为固定ep_index 用于测试全局promopt
-        ep_states = self._get_episode_states(1)    # (L, state_dim)
-
-        if self.pad_episode:
-            # 若开启定长模式，则 pad 到 (T, D)，并返回 mask（True=有效，False=pad）
-            ep_states_pad, ep_mask = self._pad_episode(ep_states, self.max_episode_len)  # (T,D),(T,)
-            item["episode_state"] = ep_states_pad       # 写入定长序列
-            item["episode_mask"]  = ep_mask             # 写入掩码
-            item["episode_len"]   = torch.tensor([int(ep_mask.sum().item())], dtype=torch.long)
-        else:
-            item["episode_state"] = ep_states           # (L, D)
-            item["episode_len"]   = torch.tensor([ep_states.shape[0]], dtype=torch.long)
-
+        ep_states = self._get_episode_states(ep_idx)    # (L, state_dim)
+        ep_left_arm = ep_states[:, :6]
+        ep_right_arm = ep_states[:, 7:13]
+        all_data = torch.cat([ep_left_arm, ep_right_arm], dim=1)
+        
+        # waypoints = greedy_waypoint_selection(env=None, actions=all_data, 
+        #                                       gt_states = all_data,
+        #                                       err_threshold=0.01,
+        #                                       pos_only=True,)
+        
+        # L = ep_states.shape[0]
+        # ep_mask = torch.zeros(L, dtype=torch.float)
+        # ep_mask[waypoints] = 1
+        ep_mask = np.zeros([all_data.shape[0]], dtype=np.float32)
+        item["episode_state"] = ep_states
+        item["episode_mask"]  = ep_mask
+        item["episode_length"] = 250
+        
+        target_length = item["episode_length"]
+    
+        # Truncate or pad ep_states
+        current_length = item["episode_state"].size(0)  # Get the first dimension size (e.g., batch size)
+        if current_length < target_length:
+            pad_size = target_length - current_length
+            # Pad along the first dimension (along the batch dimension)
+            item["episode_state"] = torch.cat([item["episode_state"], torch.zeros(pad_size, item["episode_state"].size(1), dtype=torch.float32)], dim=0)
+        elif current_length > target_length:
+            item["episode_state"] = item["episode_state"][:target_length]
+        
+        # Truncate or pad ep_mask
+        current_length = item["episode_mask"].size(0)  # Get the first dimension size (e.g., batch size)
+        
+        if current_length < target_length:
+            pad_size = target_length - current_length
+            if item["episode_mask"].dim() == 1:
+                # Pad a 1D tensor along the first dimension
+                item["episode_mask"] = torch.cat([item["episode_mask"], torch.zeros(pad_size, dtype=torch.float32)], dim=0)
+            else:
+                # Pad a 2D tensor along the first dimension (assuming it's of the form [batch_size, features])
+                item["episode_mask"] = torch.cat([item["episode_mask"], torch.zeros(pad_size, item["episode_mask"].size(1), dtype=torch.float32)], dim=0)
+        elif current_length > target_length:
+            item["episode_mask"] = item["episode_mask"][:target_length]
         return item 
     
     def _get_episode_states(self, ep_idx: int) -> torch.Tensor:

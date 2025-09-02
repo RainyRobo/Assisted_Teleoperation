@@ -128,6 +128,9 @@ from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+import numpy as np
+from waypoint_extraction.extract_waypoints import dp_waypoint_selection, greedy_waypoint_selection, backtrack_waypoint_selection
+
 
 # import get_episoid as _get_episoid
 from openpi.serving import get_episoid as _get_episoid
@@ -182,7 +185,20 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 # TODO : Preset interface, currently used for reading training data.
-                obs["ep_state"] = _get_episoid.get_episode_states(self.ds, episode_index=10).numpy()
+                his_state= _get_episoid.get_episode_states(self.ds, episode_index=0).numpy()
+                obs["ep_state"] = his_state
+                data_left = his_state[:, :6]
+                data_right = his_state[:, 7:13]
+                all_data = np.concatenate([data_left, data_right], axis=1)
+                # waypoints = greedy_waypoint_selection(obs["ep_state"])
+                waypoints = greedy_waypoint_selection(env=None, actions=all_data, 
+                                              gt_states = all_data,
+                                              err_threshold=0.01,
+                                              pos_only=True,)
+                ep_mask = np.zeros(obs["ep_state"].shape[0], dtype=np.float32)
+                # ep_mask[waypoints] = 1
+                obs["ep_mask"] = ep_mask
+                
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time

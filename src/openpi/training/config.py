@@ -427,7 +427,7 @@ class TrainConfig:
     num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
-    log_interval: int = 100
+    log_interval: int = 1000
     # How often (in steps) to save checkpoints.
     save_interval: int = 5000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -815,7 +815,7 @@ _CONFIGS = [
 
     # aloha_sim_finetune
     TrainConfig(
-        project_name="pi0_aloha_sim",
+        project_name="pi0_aloha_sim_extra",
         name="pi0_aloha_sim_transfer_cube",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAlohaDataConfig(
@@ -851,8 +851,52 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
-        batch_size=1,
-        wandb_enabled=False
+        batch_size=14,
+        wandb_enabled=True
+    ),
+    # aloha_sim_finetune
+    TrainConfig(
+        project_name="pi0_pick_multi",
+        name="pi0_finetune_pick_multi",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotAlohaDataConfig(
+            repo_id="RainyBot/pick_multi",
+            use_delta_joint_actions=False,
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="trossen",
+            ),
+            default_prompt="pick one cube from multiple choices",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_low":
+                                 "observation.images.cam_low",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            # 新增
+                            "ep_state": "episode_state", 
+                            "ep_mask": "episode_mask", 
+                            "ep_length": "episode_length"
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=28,
+        wandb_enabled=True
     ),
     #
     # Debugging configs.

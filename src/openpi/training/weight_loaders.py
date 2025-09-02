@@ -54,7 +54,7 @@ class CheckpointWeightLoader(WeightLoader):
 
         # TODO ".*(lora|human_action_emd|state_emd|cross_pool|gauss).*")
         # return _merge_params(loaded_params, params, missing_regex=".*lora.*")
-        return _merge_params(loaded_params, params, missing_regex = ".*(lora|state_to_ep_state_emb).*")
+        return _merge_params(loaded_params, params, missing_regex = ".*(lora|ep_state_proj_prefix|mod_ln|img_proj|text_proj|ep_proj)")
 
 @dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):

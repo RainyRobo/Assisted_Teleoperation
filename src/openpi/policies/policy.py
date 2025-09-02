@@ -48,7 +48,9 @@ class Policy(BasePolicy):
         inputs = jax.tree.map(lambda x: x, obs)
 
         inputs = self._input_transform(inputs)
-
+        # print("AAAAAAAA inputs:", inputs.keys())
+        # print("AAAAAAAA inputs:", np.sum(inputs["ep_mask"]))
+        
         # Make a batch and convert to jax.Array.
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
 
