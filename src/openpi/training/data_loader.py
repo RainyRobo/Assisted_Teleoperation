@@ -190,15 +190,15 @@ class LerobotDataset_HandR(lerobot_dataset.LeRobotDataset):
         ep_right_arm = ep_states[:, 7:13]
         all_data = torch.cat([ep_left_arm, ep_right_arm], dim=1)
         
-        # waypoints = greedy_waypoint_selection(env=None, actions=all_data, 
-        #                                       gt_states = all_data,
-        #                                       err_threshold=0.01,
-        #                                       pos_only=True,)
+        waypoints = greedy_waypoint_selection(env=None, actions=all_data, 
+                                              gt_states = all_data,
+                                              err_threshold=0.01,
+                                              pos_only=True,)
         
-        # L = ep_states.shape[0]
-        # ep_mask = torch.zeros(L, dtype=torch.float)
-        # ep_mask[waypoints] = 1
-        ep_mask = np.zeros([all_data.shape[0]], dtype=np.float32)
+        L = ep_states.shape[0]
+        ep_mask = torch.zeros(L, dtype=torch.float)
+        ep_mask[waypoints] = 1
+        # ep_mask = np.zeros([all_data.shape[0]], dtype=np.float32)
         item["episode_state"] = ep_states
         item["episode_mask"]  = ep_mask
         item["episode_length"] = 250
