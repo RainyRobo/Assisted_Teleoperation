@@ -77,7 +77,7 @@ class Pi0Config(_model.BaseModelConfig):
     max_token_len: int = 48
 
     # 新增 
-    human_ep_state_horizon = 400
+    max_humanInten_len = 400
 
     @property
     @override
@@ -108,8 +108,9 @@ class Pi0Config(_model.BaseModelConfig):
                     # "low_0_rgb":image_mask_spec
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                ep_state=jax.ShapeDtypeStruct([batch_size,  self.action_dim], jnp.float32),
-                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.human_ep_state_horizon, self.max_token_len], jnp.int32),
+                ep_state=jax.ShapeDtypeStruct([batch_size, self.max_humanInten_len, self.action_dim], jnp.float32),
+                ep_mask=jax.ShapeDtypeStruct([batch_size, self.max_humanInten_len], bool),      
+                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
@@ -218,23 +219,33 @@ class Pi0(_model.BaseModel):
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
         
-        # 3. 新增 embed human episode state
+        # 3. human intention
         if obs.ep_state is not None:
-            # 截断到 200 帧
-            ep_state = obs.ep_state[:, :200, :]
-            ep_state_tokens = self.state_proj(ep_state)
+            ep_state = obs.ep_state
+            ep_mask = obs.ep_mask
+            ep_state = ep_state * ep_mask[..., None]   # (B, T, D)
+            # jax.debug.print("11111111 {}", ep_state[0, -1, :])
+            
+        
+        
+        
+        
+        # if obs.ep_state is not None:
+        #     # 截断到 200 帧
+        #     ep_state = obs.ep_state[:, :200, :]
+        #     ep_state_tokens = self.state_proj(ep_state)
 
-            ep_state_tokens = self.state_to_ep_state_emb(ep_state_tokens)
-            tokens.append(ep_state_tokens)
+        #     ep_state_tokens = self.state_to_ep_state_emb(ep_state_tokens)
+        #     tokens.append(ep_state_tokens)
 
-            # 对应的输入 mask：如果有专门的 ep_state_mask 就用，没有就默认全 True
-            if getattr(obs, "ep_state_mask", None) is not None:
-                input_mask.append(obs.ep_state_mask)          # 期望形状 [B, T_s]
-            else:
-                input_mask.append(jnp.ones(ep_state_tokens.shape[:2], dtype=bool))
+        #     # 对应的输入 mask：如果有专门的 ep_state_mask 就用，没有就默认全 True
+        #     if getattr(obs, "ep_state_mask", None) is not None:
+        #         input_mask.append(obs.ep_state_mask)          # 期望形状 [B, T_s]
+        #     else:
+        #         input_mask.append(jnp.ones(ep_state_tokens.shape[:2], dtype=bool))
 
-            # 与图像/语言一样，允许全局注意力；长度按本段 token 的序列长度扩展
-            ar_mask += [False] * ep_state_tokens.shape[1]  
+        #     # 与图像/语言一样，允许全局注意力；长度按本段 token 的序列长度扩展
+        #     ar_mask += [False] * ep_state_tokens.shape[1]  
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
@@ -282,7 +293,62 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+
+    @override
+    def compute_loss(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation, 
+        actions: _model.Actions,
+        *, 
+        train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        # jax.debug.print("---------- {}",observation.ep_state.shape)
     
+        batch_shape = actions.shape[:-2]
+        
+        # noise (28, 50, 32)
+        noise = jax.random.normal(noise_rng, actions.shape) 
+        
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        
+        # ground truth!
+        u_t = noise - actions
+
+        # one big forward pass of prefix + suffix at once
+        # prefix_tokens including images and language: jnp.concatenate(img.emb, lang.emb,axis=1)
+        # prefix_tokens (28, 816, 2048)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        
+        #suffix_tokens including state and action_time token
+        # suffix_tokens (28, 51, 1024)
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)
+        
+        # (b,images+language+state+action_time,emb)
+        # input_mask (28, 867)
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        
+        # ar_mask (867,)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+        
+        # suffix_out (10, 51, 1024)
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
+        )
+        
+        # suffix_out (10, 51, 1024)-> v_t (10, 50, 32)
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
     
     # @override
     # def compute_loss(
@@ -339,60 +405,6 @@ class Pi0(_model.BaseModel):
 
     #     return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
-    @override
-    def compute_loss(
-        self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation, 
-        actions: _model.Actions,
-        *, 
-        train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
-
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-
-        batch_shape = actions.shape[:-2]
-        
-        # noise (28, 50, 32)
-        noise = jax.random.normal(noise_rng, actions.shape) 
-        
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        
-        # ground truth!
-        u_t = noise - actions
-
-        # one big forward pass of prefix + suffix at once
-        # prefix_tokens including images and language: jnp.concatenate(img.emb, lang.emb,axis=1)
-        # prefix_tokens (28, 816, 2048)
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        
-        #suffix_tokens including state and action_time token
-        # suffix_tokens (28, 51, 1024)
-        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)
-        
-        # (b,images+language+state+action_time,emb)
-        # input_mask (28, 867)
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        
-        # ar_mask (867,)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        
-        attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        
-        # suffix_out (10, 51, 1024)
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
-        )
-        
-        # suffix_out (10, 51, 1024)-> v_t (10, 50, 32)
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
     
     
     

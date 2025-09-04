@@ -93,6 +93,7 @@ class Observation(Generic[ArrayT]):
     state: at.Float[ArrayT, "*b s"]
     # 新增
     ep_state: at.Float[ArrayT, "*b t s"]
+    ep_mask: at.Bool[ArrayT, "*b t"]
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -108,6 +109,8 @@ class Observation(Generic[ArrayT]):
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
+        
+        # print("1111111111111", data.keys())
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
@@ -116,11 +119,19 @@ class Observation(Generic[ArrayT]):
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+        # 强制 dtype/形状一致
+        ep_state = data["ep_state"]
+        ep_mask  = data["ep_mask"]
+        ep_mask  = jnp.asarray(ep_mask, dtype=jnp.bool_)
+        if ep_state.shape[:-1] != ep_mask.shape:
+            raise ValueError(f"ep_state {ep_state.shape} and ep_mask {ep_mask.shape} are incompatible.")
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
             ep_state=data["ep_state"],
+            ep_mask=data["ep_mask"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -201,6 +212,7 @@ def preprocess_observation(
         image_masks=out_masks,
         state=observation.state,
         ep_state = observation.ep_state,
+        ep_mask = observation.ep_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

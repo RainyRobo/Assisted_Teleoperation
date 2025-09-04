@@ -183,7 +183,7 @@ class LerobotDataset_HandR(lerobot_dataset.LeRobotDataset):
         ep_idx = item["episode_index"].item()  # 当前样本所属的 episode 索引
 
         # 当前为固定ep_index 用于测试全局promopt
-        ep_states = self._get_episode_states(1)    # (L, state_dim)
+        ep_states = self._get_episode_states(ep_idx)    # (L, state_dim)
 
         if self.pad_episode:
             # 若开启定长模式，则 pad 到 (T, D)，并返回 mask（True=有效，False=pad）
@@ -263,6 +263,7 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)]) 
+    
 
     return dataset
 

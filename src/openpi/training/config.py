@@ -839,7 +839,8 @@ _CONFIGS = [
                             # 新增
                             "ep_state": "episode_state", 
                             # "ep_mask": "episode_mask", 
-                            "ep_length": "episode_len"
+                            # "ep_length": "episode_len",
+                            "ep_index" : "episode_index"
                         }
                     )
                 ]
@@ -851,7 +852,7 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
-        batch_size=1,
+        batch_size=2,
         wandb_enabled=False
     ),
     #

@@ -253,6 +253,7 @@ def main(config: _config.TrainConfig):
     # 数据迭代器：
     data_iter = iter(data_loader)
     batch = next(data_iter)
+    
 
 
     # logging.info(f"Current batch contains: {batch}")
