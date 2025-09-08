@@ -13,11 +13,15 @@ class AlohaSimEnvironment(_environment.Environment):
         np.random.seed(seed)
         self._rng = np.random.default_rng(seed)
 
-        self._gym = gymnasium.make(task, obs_type=obs_type)
+        self._gym = gymnasium.make(task, obs_type=obs_type, max_episode_steps=600)
 
         self._last_obs = None
         self._done = True
         self._episode_reward = 0.0
+        
+        self.history = []  # 用来记录每个时间步骤的 (time, action_dim) 数组
+        # 确保给定文件路径和文件名
+        self.history_file = "/home/liuyu/project/Assisted_Teleoperation/robot_history.npy"
 
     @override
     def reset(self) -> None:
@@ -43,6 +47,14 @@ class AlohaSimEnvironment(_environment.Environment):
         self._last_obs = self._convert_observation(gym_obs)  # type: ignore
         self._done = terminated or truncated
         self._episode_reward = max(self._episode_reward, reward)
+        
+        
+        # # 记录当前时间步骤、动作维度
+        # current_time = len(self.history)  # 当前时间步是历史记录的长度
+        # action_dim = len(action["actions"])  # 获取动作的维度
+        
+        # # 将时间步、动作维度保存到历史记录中
+        self.history.append(action["actions"])
 
     def _convert_observation(self, gym_obs: dict) -> dict:
         img = gym_obs["pixels"]["top"]
@@ -54,3 +66,12 @@ class AlohaSimEnvironment(_environment.Environment):
             "state": gym_obs["agent_pos"],
             "images": {"cam_high": img},
         }
+
+    def get_history(self):
+        """
+        返回存储的 (time, action_dim) 数组，并存储到本地
+        """
+        history_array = np.array(self.history)
+        # 确保保存到文件的路径是有效的
+        np.save(self.history_file, history_array)  # 将历史记录保存到本地文件
+        print(f"History saved to {self.history_file}")  # 输出确认消息

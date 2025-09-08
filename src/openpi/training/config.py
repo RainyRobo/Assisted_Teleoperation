@@ -843,8 +843,8 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
-        batch_size=2,
-        wandb_enabled=False
+        batch_size=6,
+        wandb_enabled=True
     ),
     #
     # Debugging configs.

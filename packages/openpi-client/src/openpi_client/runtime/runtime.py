@@ -74,6 +74,8 @@ class Runtime:
                 last_step_time = now
 
         logging.info("Episode completed.")
+        
+        self._environment.get_history()
         for subscriber in self._subscribers:
             subscriber.on_episode_end()
 
