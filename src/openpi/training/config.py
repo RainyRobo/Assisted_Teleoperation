@@ -846,6 +846,50 @@ _CONFIGS = [
         batch_size=6,
         wandb_enabled=True
     ),
+    
+        TrainConfig(
+        project_name="aloha_sim_Insert",
+        name="pi0_aloha_sim_Insert",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_insertion_human",
+            # default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="trossen",
+            ),
+            default_prompt="Insert peg into socket pins",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.top",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=6,
+        wandb_enabled=True
+    ),
+    
+    
+    
+    
+    
+    
+    
     #
     # Debugging configs.
     #

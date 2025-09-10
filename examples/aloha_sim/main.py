@@ -15,7 +15,8 @@ import tyro
 class Args:
     out_dir: pathlib.Path = pathlib.Path("data/aloha_sim/videos")
 
-    task: str = "gym_aloha/AlohaTransferCube-v0"
+    # task: str = "gym_aloha/AlohaTransferCube-v0"
+    task: str = "gym_aloha/AlohaInsertion-v0"
     seed: int = 10
 
     action_horizon: int = 10
